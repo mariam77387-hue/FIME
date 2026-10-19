@@ -1,13 +1,11 @@
 import os
 import sys
 import asyncio
-import getpass
 import logging
 import requests
 import discord
 from discord.ext import commands
 
-# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s — %(message)s",
@@ -15,7 +13,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("scan")
 
-CACHE_FILE = ".discord_session_token"
 API_BASE = "https://discord.com/api/v9"
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,29 +20,14 @@ UA = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-
-# =========================
-# Login
-# =========================
-def safe_getpass(prompt: str) -> str:
-    try:
-        return getpass.getpass(prompt)
-    except Exception:
-        print(prompt.replace("(لن تظهر)", "(سيظهر)"))
-        return input()
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+EMAIL = os.getenv("EMAIL", "").strip()
+PASSWORD = os.getenv("PASSWORD", "").strip()
+TWOFA = os.getenv("TWOFA", "").strip()
+GUILD_ID = os.getenv("GUILD_ID", "").strip()
 
 
-def prompt_login():
-    print("\n" + "=" * 60)
-    print("🔐 تسجيل الدخول إلى حساب ديسكورد")
-    print("=" * 60)
-    email = input("📧 البريد/الهاتف: ").strip()
-    password = safe_getpass("🔑 كلمة المرور (لن تظهر): ")
-    return email, password
-
-
-def api_login(email: str, password: str):
-    url = f"{API_BASE}/auth/login"
+def api_login(email, password, twofa=""):
     headers = {
         "Content-Type": "application/json",
         "User-Agent": UA,
@@ -61,321 +43,174 @@ def api_login(email: str, password: str):
         "gift_code_sku_id": None,
     }
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=30)
-    except requests.RequestException as e:
-        return None, f"فشل الاتصال: {e}"
-
-    try:
+        r = requests.post(f"{API_BASE}/auth/login", json=payload, headers=headers, timeout=30)
         data = r.json()
-    except Exception:
-        return None, f"رد غير متوقع (HTTP {r.status_code})"
+    except Exception as e:
+        return None, f"اتصال فشل: {e}"
 
     if "token" in data:
         return data["token"], None
 
     if data.get("mfa"):
-        print("\n🔒 الحساب عليه تحقق بخطوتين (2FA)")
-        code = input("📱 أدخل رمز 2FA: ").strip()
+        if not twofa:
+            return None, "الحساب يحتاج 2FA. حط TWOFA في env"
         try:
             r2 = requests.post(
                 f"{API_BASE}/auth/mfa/totp",
-                json={
-                    "code": code,
-                    "ticket": data["ticket"],
-                    "login_source": None,
-                    "gift_code_sku_id": None,
-                },
-                headers=headers,
-                timeout=30,
+                json={"code": twofa, "ticket": data["ticket"],
+                      "login_source": None, "gift_code_sku_id": None},
+                headers=headers, timeout=30,
             )
             d2 = r2.json()
+            if "token" in d2:
+                return d2["token"], None
+            return None, f"MFA مرفوض: {d2}"
         except Exception as e:
-            return None, f"MFA فشل: {e}"
-        if "token" in d2:
-            return d2["token"], None
-        return None, f"MFA مرفوض: {d2}"
+            return None, f"MFA: {e}"
 
     if "captcha_key" in data:
-        return None, "CAPTCHA"
+        return None, "CAPTCHA مطلوب — استخدم DISCORD_TOKEN مباشرة"
 
     return None, f"رد غير معروف: {data}"
 
 
-def load_cached_token():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                t = f.read().strip()
-                return t or None
-        except Exception:
-            return None
-    return None
-
-
-def save_token(token: str):
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            f.write(token)
-    except Exception as e:
-        log.warning(f"تعذر حفظ التوكن: {e}")
-
-
-# =========================
-# Bot
-# =========================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(
-    command_prefix="!x",
-    self_bot=True,
-    intents=intents,
-    help_command=None,
-)
+bot = commands.Bot(command_prefix="!x", self_bot=True, intents=intents, help_command=None)
 
 
-def fmt_author(m) -> str:
+def fmt_author(m):
     try:
         a = m.author
-        name = getattr(a, "name", "unknown")
-        disc = getattr(a, "discriminator", "0")
-        if disc and disc != "0":
-            name = f"{name}#{disc}"
-        return f"{name} [{a.id}]"
+        n = getattr(a, "name", "unknown")
+        d = getattr(a, "discriminator", "0")
+        if d and d != "0":
+            n = f"{n}#{d}"
+        return f"{n} [{a.id}]"
     except Exception:
         return "unknown"
 
 
-def fmt_message(m) -> str:
+def fmt_message(m):
     try:
         ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         ts = "?"
-    lines = [f"[{ts}] {fmt_author(m)}: {getattr(m, 'content', '') or '[بدون نص]'}"]
+    out = [f"[{ts}] {fmt_author(m)}: {getattr(m, 'content', '') or '[بدون نص]'}"]
     try:
-        for att in m.attachments:
-            lines.append(f"    📎 {att.filename} — {att.url}")
-    except Exception:
-        pass
-    try:
-        for i, emb in enumerate(m.embeds, 1):
-            t = emb.title or "(بدون عنوان)"
-            d = (emb.description or "")[:200]
-            lines.append(f"    🧩 Embed {i}: {t} — {d}")
+        for a in m.attachments:
+            out.append(f"    📎 {a.filename} — {a.url}")
     except Exception:
         pass
     try:
         if m.reactions:
-            rs = ", ".join(f"{r.emoji}×{r.count}" for r in m.reactions)
-            lines.append(f"    ✨ {rs}")
+            out.append("    ✨ " + ", ".join(f"{r.emoji}×{r.count}" for r in m.reactions))
     except Exception:
         pass
-    try:
-        if m.reference:
-            lines.append(f"    ↩️ رد على: {m.reference.message_id}")
-    except Exception:
-        pass
-    return "\n".join(lines)
+    return "\n".join(out)
 
 
-# =========================
-# قنّاص الرسائل الخاص
-# =========================
-class PrivateHunter:
+class Hunter:
     def __init__(self):
-        self.captured = {}          # message_id -> message
-        self.blocked_channels = []  # رومات ما قدرنا نقرأها
-        self.read_channels = []     # رومات قرأناها
-        self.referenced_ids = set() # IDs لرسائل ردت عليها رسائل متاحة
+        self.captured = {}
+        self.read = []
+        self.blocked = []
+        self.refs = set()
 
     def add(self, m):
-        if m.id not in self.captured:
-            self.captured[m.id] = m
-            try:
-                if m.reference and m.reference.message_id:
-                    self.referenced_ids.add(m.reference.message_id)
-            except Exception:
-                pass
+        if m.id in self.captured:
+            return
+        self.captured[m.id] = m
+        try:
+            if m.reference and m.reference.message_id:
+                self.refs.add(m.reference.message_id)
+        except Exception:
+            pass
 
-    async def direct_pull(self, channel, limit=None):
-        """سحب مباشر — الأقوى: يستخدم صلاحيات حسابك."""
-        grabbed = 0
-        attempt = 0
+    async def pull(self, ch):
+        n = 0
+        tries = 0
         while True:
             try:
-                async for msg in channel.history(limit=limit, oldest_first=True):
+                async for msg in ch.history(limit=None, oldest_first=True):
                     self.add(msg)
-                    grabbed += 1
-                return grabbed
+                    n += 1
+                return n
             except discord.Forbidden:
-                return -1  # محجوب
+                return -1
             except discord.HTTPException as e:
-                if e.status == 429:
-                    attempt += 1
-                    if attempt > 6:
-                        return grabbed
-                    wait = 2.5 * attempt
-                    log.warning(f"⏳ rate limit #{channel.name}, انتظار {wait:.1f}s")
-                    await asyncio.sleep(wait)
+                if e.status == 429 and tries < 6:
+                    tries += 1
+                    await asyncio.sleep(2.5 * tries)
                     continue
-                return grabbed
+                return n
             except Exception:
-                return grabbed
+                return n
 
-    async def try_reference_pull(self, channel):
-        """محاولة اختطاف رسائل مرجعية داخل روم محجوب."""
+    async def ref_pull(self, ch):
         got = 0
-        for mid in list(self.referenced_ids):
+        for mid in list(self.refs):
             try:
-                m = await channel.fetch_message(mid)
+                m = await ch.fetch_message(mid)
                 self.add(m)
                 got += 1
-            except discord.NotFound:
-                continue
-            except discord.Forbidden:
-                break  # ما في أمل
             except Exception:
                 continue
         return got
 
-    async def try_search_pull(self, guild, channel):
-        """محاولة البحث داخل الروم (بعض الحسابات تمر هنا)."""
-        got = 0
+
+async def scan(guild, h):
+    print(f"\n{'='*70}\n🏰 {guild.name} | {guild.id}\n{'='*70}")
+
+    for i, ch in enumerate(guild.text_channels, 1):
+        print(f"\n📂 ({i}/{len(guild.text_channels)}) #{ch.name} | {ch.id}")
         try:
-            async for msg in channel.history(limit=None, oldest_first=True):
-                self.add(msg)
-                got += 1
-        except Exception:
-            pass
-        return got
-
-    async def scan_channel(self, channel, guild):
-        print(f"\n{'─' * 70}")
-        print(f"📂 #{channel.name}  |  ID: {channel.id}")
-        print(f"{'─' * 70}")
-
-        # 1) محاولة سحب مباشر
-        n = await self.direct_pull(channel)
-        if n >= 0:
-            print(f"  ✅ قراءة مباشرة: {n} رسالة")
-            self.read_channels.append(channel)
+            n = await h.pull(ch)
+            if n >= 0:
+                print(f"  ✅ {n} رسالة")
+                h.read.append(ch)
+            else:
+                r = await h.ref_pull(ch)
+                if r:
+                    print(f"  🎯 مرجعي: {r}")
+                    h.read.append(ch)
+                else:
+                    print("  ⛔ محجوب")
+                    h.blocked.append(ch)
             await asyncio.sleep(0.4)
-            return n
-
-        # 2) محاولة سحب مرجعي
-        print("  🔒 مباشر محجوب — تجربة صيد مرجعي...")
-        r = await self.try_reference_pull(channel)
-        if r > 0:
-            print(f"  🎯 اختطاف مرجعي: {r} رسالة")
-            self.read_channels.append(channel)
-            await asyncio.sleep(0.4)
-            return r
-
-        # 3) محاولة أخيرة عبر fetch_message عشوائي
-        try:
-            await channel.fetch_message(channel.last_message_id or 0)
-        except Exception:
-            pass
-
-        print("  ⛔ محجوب تماماً (Discord يرفض)")
-        self.blocked_channels.append(channel)
-        await asyncio.sleep(0.3)
-        return 0
-
-
-# =========================
-# الفحص
-# =========================
-async def scan_guild(guild, hunter: PrivateHunter):
-    print(f"\n{'=' * 70}")
-    print(f"🏰 {guild.name}  |  ID: {guild.id}")
-    print(f"📚 رومات نصية: {len(guild.text_channels)}")
-    print(f"{'=' * 70}")
-
-    # المرحلة 1: نجمع كل ما نقدر من كل روم
-    for ch in guild.text_channels:
-        try:
-            await hunter.scan_channel(ch, guild)
         except Exception as e:
-            log.error(f"خطأ في #{getattr(ch, 'name', '?')}: {type(e).__name__}: {e}")
+            log.error(f"خطأ #{ch.name}: {e}")
 
-    # المرحلة 2: صيد مرجعي متعدد الجولات
-    if hunter.referenced_ids:
-        print(f"\n🎯 مرحلة الصيد المرجعي: {len(hunter.referenced_ids)} مرجع")
-        for ch in guild.text_channels:
-            if ch in hunter.read_channels:
-                continue
-            try:
-                await hunter.try_reference_pull(ch)
-                await asyncio.sleep(0.3)
-            except Exception:
-                continue
+    msgs = sorted(h.captured.values(), key=lambda m: m.created_at)
+    print(f"\n📊 {len(msgs)} رسالة من {len(h.read)} روم مقروء، {len(h.blocked)} محجوب\n")
 
-    # المرحلة 3: ترتيب وطباعة
-    msgs = list(hunter.captured.values())
-    msgs.sort(key=lambda m: m.created_at)
-
-    print(f"\n\n{'=' * 70}")
-    print(f"📊 النتيجة النهائية")
-    print(f"  ✅ رومات مقروءة: {len(hunter.read_channels)}")
-    print(f"  🚫 رومات محجوبة: {len(hunter.blocked_channels)}")
-    print(f"  💬 رسائل ملتقطة: {len(msgs)}")
-    print(f"{'=' * 70}\n")
-
-    # كشف الرومات الخاصة (اللي محجوبة عن @everyone)
-    private_ids = set()
-    for ch in guild.text_channels:
-        try:
-            ow = ch.overwrites_for(guild.default_role)
-            if ow.view_channel is False:
-                private_ids.add(ch.id)
-        except Exception:
-            pass
-
-    print("--- الرومات الخاصة ---")
-    for ch in guild.text_channels:
-        if ch.id in private_ids:
-            status = "✅ مقروء" if ch in hunter.read_channels else "🚫 محجوب"
-            print(f"  🔒 #{ch.name} [{ch.id}] — {status}")
-
-    print("\n--- الرسائل (مرتبة زمنياً) ---\n")
     for m in msgs:
-        try:
-            ch_name = getattr(m.channel, "name", "?")
-            ch_private = "🔒" if getattr(m.channel, "id", 0) in private_ids else "🌐"
-            print(f"{ch_private} #{ch_name}")
-            print(fmt_message(m))
-            print()
-        except Exception:
-            continue
+        print(fmt_message(m) + "\n")
 
-    # حفظ
     try:
         with open("dump.txt", "w", encoding="utf-8") as f:
             for m in msgs:
-                try:
-                    f.write(f"#{getattr(m.channel, 'name', '?')}\n")
-                    f.write(fmt_message(m) + "\n\n")
-                except Exception:
-                    continue
-        log.info("✅ حفظ dump.txt")
-    except Exception as e:
-        log.warning(f"تعذر حفظ dump.txt: {e}")
+                f.write(fmt_message(m) + "\n\n")
+    except Exception:
+        pass
 
 
-# =========================
-# on_ready
-# =========================
 @bot.event
 async def on_ready():
-    print(f"\n✅ تم الدخول كـ {bot.user}")
+    print(f"✅ {bot.user}")
+
+    if not GUILD_ID:
+        log.error("❌ GUILD_ID غير موجود في Environment")
+        await bot.close()
+        return
 
     try:
-        gid = int(input("\n🔢 آيدي السيرفر: ").strip())
-    except (ValueError, TypeError):
-        log.error("❌ آيدي غير صالح")
+        gid = int(GUILD_ID)
+    except ValueError:
+        log.error("❌ GUILD_ID غير صالح")
         await bot.close()
         return
 
@@ -383,54 +218,38 @@ async def on_ready():
     if guild is None:
         try:
             guild = await bot.fetch_guild(gid)
-        except discord.NotFound:
-            log.error("❌ السيرفر غير موجود أو ما أنت عضو فيه")
-            await bot.close()
-            return
         except Exception as e:
-            log.error(f"❌ {e}")
+            log.error(f"❌ ما قدرت أجيب السيرفر: {e}")
             await bot.close()
             return
 
-    hunter = PrivateHunter()
+    h = Hunter()
     try:
-        await scan_guild(guild, hunter)
+        await scan(guild, h)
     except Exception as e:
-        log.error(f"❌ خطأ في الفحص: {type(e).__name__}: {e}")
+        log.error(f"❌ {e}")
     finally:
-        print("\n🏁 انتهى الفحص.")
+        print("🏁 انتهى")
         await bot.close()
 
 
-# =========================
 def main():
-    token = os.getenv("DISCORD_TOKEN") or load_cached_token()
+    token = TOKEN
 
     if not token:
-        email, password = prompt_login()
-        token, err = api_login(email, password)
-        if err:
-            if err == "CAPTCHA":
-                print("\n❌ Discord طلب كابتشا.")
-                print("   حل يدوي: افتح ديسكورد → F12 → Application → Local Storage →")
-                print("   https://discord.com → انسخ token → حطه في Secrets باسم DISCORD_TOKEN")
-            else:
-                print(f"\n❌ فشل: {err}")
+        if not EMAIL or not PASSWORD:
+            log.error("❌ لازم DISCORD_TOKEN أو (EMAIL + PASSWORD) في env")
             sys.exit(1)
-        save_token(token)
-        print("\n✅ تم تسجيل الدخول")
+        token, err = api_login(EMAIL, PASSWORD, TWOFA)
+        if err:
+            log.error(f"❌ {err}")
+            sys.exit(1)
+        print("✅ تم تسجيل الدخول")
 
     try:
         bot.run(token)
-    except discord.LoginFailure:
-        print("\n❌ توكن غير صالح، حذف الكاش...")
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\n⏹️ إيقاف")
     except Exception as e:
-        print(f"\n❌ {type(e).__name__}: {e}")
+        log.error(f"❌ {type(e).__name__}: {e}")
         sys.exit(1)
 
 
