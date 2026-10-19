@@ -3,12 +3,13 @@ import sys
 import types
 import io
 import time
+import json
 import asyncio
 import threading
 import logging
 import requests
 
-# audioop stub (قبل discord)
+# audioop stub
 if "audioop" not in sys.modules:
     try:
         import audioop  # noqa
@@ -40,7 +41,8 @@ log = logging.getLogger("scan")
 
 API_BASE = "https://discord.com/api/v9"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36")
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/131.0.0.0 Safari/537.36")
 
 TG_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -62,11 +64,11 @@ state = {
     "default_chat": int(TG_CHAT_ID) if TG_CHAT_ID.isdigit() else None,
     "scanning": False,
     "last_error": None,
-    "login_locked": False,
+    "login_attempts": 0,
 }
 
 # =========================
-# Flask keep-alive
+# Flask
 # =========================
 flask_app = Flask(__name__)
 
@@ -90,7 +92,7 @@ def self_ping_loop():
         time.sleep(14 * 60)
 
 # =========================
-# Telegram senders
+# Telegram
 # =========================
 def send_tg(chat_id, text, md=False):
     if not chat_id or not state["tg_loop"] or not state["tg_app"]:
@@ -126,43 +128,69 @@ def notify(text):
         send_tg(chat, text)
 
 # =========================
-# Discord login
+# Discord login — الإصلاح هنا
 # =========================
-def api_login(email, password, twofa="", max_retries=3):
-    headers = {
+def _login_headers():
+    return {
         "Content-Type": "application/json",
         "User-Agent": UA,
         "Origin": "https://discord.com",
         "Referer": "https://discord.com/login",
+        "X-Discord-Locale": "en-US",
+        "X-Debug-Options": "bugReporterEnabled",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
     }
-    payload = {"email": email, "password": password, "undelete": False,
-               "captcha_key": None, "login_source": None, "gift_code_sku_id": None}
 
-    last_err = None
+def api_login(email, password, twofa="", max_retries=3):
+    # Discord غيّر الحقل من email إلى login
+    payload = {
+        "login": email,
+        "password": password,
+        "undelete": False,
+        "captcha_key": None,
+        "login_source": None,
+        "gift_code_sku_id": None,
+    }
+
+    last_err = "فشل غير معروف"
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.post(f"{API_BASE}/auth/login", json=payload, headers=headers, timeout=30)
-            try:
-                data = r.json()
-            except Exception:
-                last_err = f"HTTP {r.status_code}"
-                data = {}
+            r = requests.post(
+                f"{API_BASE}/auth/login",
+                data=json.dumps(payload),
+                headers=_login_headers(),
+                timeout=30,
+            )
         except Exception as e:
             last_err = f"اتصال: {e}"
+            log.warning(f"login attempt {attempt}: {last_err}")
+            time.sleep(3)
+            continue
+
+        try:
+            data = r.json()
+        except Exception:
             data = {}
 
+        log.info(f"login HTTP {r.status_code} body-keys={list(data.keys())}")
+
+        # نجاح
         if "token" in data:
             return data["token"], None
 
-        if data.get("mfa"):
+        # MFA
+        if data.get("mfa") or data.get("ticket"):
             if not twofa:
-                return None, "الحساب يحتاج 2FA — حط DISCORD_2FA في env"
+                return None, "2FA مطلوب — حط DISCORD_2FA في env (رمز من تطبيق المصادقة)"
             try:
                 r2 = requests.post(
                     f"{API_BASE}/auth/mfa/totp",
-                    json={"code": twofa, "ticket": data["ticket"],
-                          "login_source": None, "gift_code_sku_id": None},
-                    headers=headers, timeout=30)
+                    data=json.dumps({"code": twofa, "ticket": data["ticket"],
+                                     "login_source": None, "gift_code_sku_id": None}),
+                    headers=_login_headers(),
+                    timeout=30,
+                )
                 d2 = r2.json()
                 if "token" in d2:
                     return d2["token"], None
@@ -170,33 +198,51 @@ def api_login(email, password, twofa="", max_retries=3):
             except Exception as e:
                 return None, f"2FA: {e}"
 
-        if "captcha_key" in data or "captcha_sitekey" in data:
-            last_err = "CAPTCHA من Discord — جرب بعد دقائق"
+        # CAPTCHA
+        if "captcha_key" in data or "captcha_sitekey" in data or "captcha_service" in data:
+            svc = data.get("captcha_service", "hcaptcha")
+            last_err = (
+                f"CAPTCHA مطلوب من Discord ({svc}).\n"
+                "الحل: افتح Discord في متصفح على جهازك، سجّل دخول مرة وحدة،\n"
+                "ثم انسخ التوكن (F12 → Application → Local Storage → https://discord.com → token)\n"
+                "وحطه في متغير DISCORD_TOKEN بدل الإيميل/الباسوورد."
+            )
+            log.warning(f"CAPTCHA ({svc}) attempt {attempt}")
             if attempt < max_retries:
-                wait = 15 * attempt
-                log.warning(f"CAPTCHA. انتظار {wait}s (محاولة {attempt}/{max_retries})")
-                time.sleep(wait)
+                time.sleep(10 * attempt)
                 continue
             return None, last_err
 
+        # بيانات غلط فعلاً
         if r.status_code in (400, 401):
-            return None, "الإيميل أو كلمة المرور غلط"
+            msg = data.get("message", "") or str(data)
+            if "invalid" in msg.lower() or "credentials" in msg.lower():
+                return None, "الإيميل أو كلمة المرور غير صحيحة (تأكد من الحقلين في Render)"
+            # 400 شكل آخر — نرجع التفاصيل
+            last_err = f"Discord رفض الطلب: HTTP {r.status_code} — {msg}"
+            if attempt < max_retries:
+                time.sleep(5 * attempt)
+                continue
+            return None, last_err
+
         if r.status_code == 429:
-            last_err = "Rate limit من Discord"
+            last_err = "Rate limit من Discord — انتظر شوي"
             time.sleep(20 * attempt)
             continue
 
-        last_err = f"فشل: {data.get('message', data) or last_err}"
+        last_err = f"HTTP {r.status_code}: {data.get('message', data)}"
         time.sleep(5 * attempt)
 
-    return None, last_err or "فشل غير معروف"
+    return None, last_err
 
 def detect_token_type(token):
     for prefix, kind in [("", "user"), ("Bot ", "bot")]:
         try:
-            r = requests.get(f"{API_BASE}/users/@me",
-                             headers={"Authorization": f"{prefix}{token}", "User-Agent": UA},
-                             timeout=10)
+            r = requests.get(
+                f"{API_BASE}/users/@me",
+                headers={"Authorization": f"{prefix}{token}", "User-Agent": UA},
+                timeout=10,
+            )
             if r.status_code == 200:
                 return kind
         except Exception:
@@ -204,7 +250,7 @@ def detect_token_type(token):
     return None
 
 # =========================
-# Discord bot thread
+# Discord worker
 # =========================
 def _discord_worker(token, token_type):
     loop = asyncio.new_event_loop()
@@ -228,14 +274,14 @@ def _discord_worker(token, token_type):
     async def on_ready():
         state["discord_ready"] = True
         log.info(f"✅ Discord: {bot.user} ({token_type})")
-        notify(f"✅ Discord جاهز\nالحساب: {bot.user}\nالنوع: {token_type}\nأرسل /help")
+        notify(f"✅ Discord جاهز\nالحساب: {bot.user}\nالنوع: {token_type}\nأرسل /private <guild_id>")
 
     try:
         loop.run_until_complete(bot.start(token))
     except Exception as e:
         state["last_error"] = f"discord: {e}"
         log.error(state["last_error"])
-        notify(f"❌ فشل Discord: {e}")
+        notify(f"❌ فشل اتصال Discord: {e}")
 
 def start_discord():
     if state["discord_bot"]:
@@ -252,7 +298,7 @@ def start_discord():
     return True
 
 # =========================
-# Formatting
+# Format
 # =========================
 def fmt_author(m):
     try:
@@ -272,13 +318,6 @@ def fmt_message(m):
     try:
         for a in m.attachments:
             out.append(f"    📎 {a.filename} — {a.url}")
-    except Exception:
-        pass
-    try:
-        for i, emb in enumerate(getattr(m, "embeds", []) or [], 1):
-            t = emb.title or ""
-            d = (emb.description or "")[:150]
-            out.append(f"    🧩 [{i}] {t} — {d}")
     except Exception:
         pass
     try:
@@ -374,7 +413,7 @@ async def do_scan(guild_id, chat_id, only_private=False):
             return
 
         mode = "🔒 خاصة فقط" if only_private else "📚 كل الرومات"
-        send_tg(chat_id, f"🔍 بدء الفحص: {guild.name}\nالوضع: {mode}\nرومات: {len(channels)}")
+        send_tg(chat_id, f"🔍 بدء: {guild.name}\nالوضع: {mode}\nرومات: {len(channels)}")
 
         h = Hunter()
         total = len(channels)
@@ -420,10 +459,10 @@ async def do_scan(guild_id, chat_id, only_private=False):
         else:
             send_tg_doc(chat_id, f"{guild.name}_all.txt", data, summary)
 
-            # ملف منفصل لكل روم
             by_channel = {}
             for m in msgs:
                 by_channel.setdefault(getattr(m.channel, "name", "?"), []).append(m)
+
             for ch_name, ch_msgs in by_channel.items():
                 text = "".join(fmt_message(m) + "\n\n" for m in ch_msgs)
                 safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in ch_name)[:50]
@@ -436,19 +475,19 @@ async def do_scan(guild_id, chat_id, only_private=False):
 # Telegram handlers
 # =========================
 HELP = (
-    "*أوامر البوت*\n\n"
-    "/private `<guild_id>` — فحص الرومات الخاصة فقط\n"
-    "/scan `<guild_id>` — فحص كل الرومات\n"
-    "/channels `<guild_id>` — عرض الرومات مصنفة\n"
-    "/status — حالة الاتصال\n"
-    "/cancel — إلغاء عرض\n\n"
+    "*الأوامر*\n\n"
+    "/private `<guild_id>` — الرومات الخاصة فقط\n"
+    "/scan `<guild_id>` — كل الرومات\n"
+    "/channels `<guild_id>` — تصنيف الرومات\n"
+    "/status — الحالة\n"
+    "/retry_login — إعادة محاولة الدخول (لو كان فشل)\n\n"
     "لو حطيت `GUILD_ID` في env، تقدر تحذف الآيدي."
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["default_chat"] = update.effective_chat.id
     ready = state["discord_ready"]
-    err = f"\n\n⚠️ آخر خطأ: `{state['last_error']}`" if state["last_error"] else ""
+    err = f"\n\n⚠️ آخر خطأ:\n`{state['last_error']}`" if state["last_error"] else ""
     await update.message.reply_text(
         f"👋 أهلاً\nDiscord: {'✅ جاهز' if ready else '⏳ يتصل...'}{err}\n\n{HELP}",
         parse_mode=ParseMode.MARKDOWN,
@@ -456,6 +495,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP, parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_retry_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if state["discord_ready"]:
+        await update.message.reply_text("✅ Discord متصل أصلاً")
+        return
+    if not DC_EMAIL or not DC_PASSWORD:
+        await update.message.reply_text("❌ DISCORD_EMAIL أو DISCORD_PASSWORD غير موجود في env")
+        return
+    await update.message.reply_text("⏳ إعادة محاولة الدخول...")
+    token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
+    if err:
+        state["last_error"] = err
+        await update.message.reply_text(f"❌ {err}")
+        return
+    state["discord_token"] = token
+    if start_discord():
+        await update.message.reply_text("✅ نجح، جاري الاتصال...")
+    else:
+        await update.message.reply_text("❌ التوكن غير صالح")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = state["discord_bot"]
@@ -467,7 +525,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*فحص جاري:* {'نعم' if state['scanning'] else 'لا'}",
     ]
     if state["last_error"]:
-        lines.append(f"*آخر خطأ:* `{state['last_error']}`")
+        lines.append(f"*آخر خطأ:*\n`{state['last_error']}`")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def _resolve_guild(context):
@@ -481,7 +539,7 @@ async def _resolve_guild(context):
             return int(DEFAULT_GUILD), None
         except ValueError:
             return None, "❌ GUILD_ID في env غير صالح"
-    return None, "الاستخدام: أرسل الأمر مع آيدي السيرفر"
+    return None, "أرسل الأمر مع آيدي السيرفر"
 
 async def cmd_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["default_chat"] = update.effective_chat.id
@@ -489,7 +547,7 @@ async def cmd_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ فيه فحص جاري")
         return
     if not state["discord_ready"]:
-        await update.message.reply_text("❌ Discord ما اتصل بعد")
+        await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
         return
     gid, err = await _resolve_guild(context)
     if err:
@@ -507,7 +565,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ فيه فحص جاري")
         return
     if not state["discord_ready"]:
-        await update.message.reply_text("❌ Discord ما اتصل بعد")
+        await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
         return
     gid, err = await _resolve_guild(context)
     if err:
@@ -522,7 +580,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["default_chat"] = update.effective_chat.id
     if not state["discord_ready"]:
-        await update.message.reply_text("❌ Discord ما اتصل بعد")
+        await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
         return
     gid, err = await _resolve_guild(context)
     if err:
@@ -543,28 +601,25 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"*🏰 {guild.name}*",
                  f"🔒 خاصة: {len(private)} | 🌐 عامة: {len(public)}", ""]
         if private:
-            lines.append("*🔒 الرومات الخاصة:*")
+            lines.append("*🔒 الخاصة:*")
             for c in private[:30]:
                 lines.append(f"• #{c.name} (`{c.id}`)")
             if len(private) > 30:
-                lines.append(f"... و{len(private)-30} روم آخر")
+                lines.append(f"... و{len(private)-30}")
             lines.append("")
         if public:
-            lines.append("*🌐 الرومات العامة:*")
+            lines.append("*🌐 العامة:*")
             for c in public[:20]:
                 lines.append(f"• #{c.name}")
             if len(public) > 20:
-                lines.append(f"... و{len(public)-20} روم آخر")
+                lines.append(f"... و{len(public)-20}")
         send_tg(update.effective_chat.id, "\n".join(lines), md=True)
 
     asyncio.run_coroutine_threadsafe(_list(), state["discord_loop"])
     await update.message.reply_text("📋 جاري الجلب...")
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ℹ️ لإيقاف فحص جاري، انتظر ينتهي أو أعد تشغيل الخدمة")
-
 # =========================
-# post_init — يبدأ discord auto
+# post_init
 # =========================
 async def post_init(app: Application):
     state["tg_loop"] = asyncio.get_running_loop()
@@ -573,20 +628,22 @@ async def post_init(app: Application):
 
     if state["discord_token"]:
         if start_discord():
-            log.info("⏳ Discord auto-start")
+            log.info("⏳ Discord auto-start (توكن)")
     elif DC_EMAIL and DC_PASSWORD:
         notify("🔐 جاري تسجيل الدخول إلى Discord...")
+        state["login_attempts"] += 1
         token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
         if token:
             state["discord_token"] = token
+            state["last_error"] = None
             if start_discord():
                 log.info("✅ auto login نجح")
         else:
             state["last_error"] = err
             log.error(f"auto login: {err}")
-            notify(f"❌ فشل تسجيل دخول Discord:\n`{err}`")
+            notify(f"❌ فشل تسجيل دخول Discord:\n{err}")
     else:
-        notify("⚠️ ما فيه توكن ولا إيميل/باسوورد في env — أضف DISCORD_EMAIL و DISCORD_PASSWORD")
+        notify("⚠️ ما فيه DISCORD_EMAIL أو DISCORD_PASSWORD في env")
 
 # =========================
 def main():
@@ -600,11 +657,11 @@ def main():
     app = Application.builder().token(TG_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("retry_login", cmd_retry_login))
     app.add_handler(CommandHandler("private", cmd_private))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("channels", cmd_channels))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     log.info("🤖 Telegram polling...")
     app.run_polling(drop_pending_updates=True)
