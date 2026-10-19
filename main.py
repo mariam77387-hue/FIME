@@ -31,6 +31,7 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,11 +64,10 @@ state = {
     "default_chat": int(TG_CHAT_ID) if TG_CHAT_ID.isdigit() else None,
     "scanning": False,
     "last_error": None,
-    "captcha_handler": None,
 }
 
 # ============================================================
-# NoneCap — مع rqdata
+# NoneCap
 # ============================================================
 def solve_nonecap(sitekey, rqdata="", rqtoken="", url="https://discord.com/login", wait=30):
     if not NONECAP_KEY:
@@ -96,15 +96,14 @@ def solve_nonecap(sitekey, rqdata="", rqtoken="", url="https://discord.com/login
             return token, None
         if data.get("status") == "pending":
             return _poll_nonecap(data.get("id"), wait)
-        return None, f"NoneCap رد بدون token: {data}"
+        return None, f"NoneCap رد بدون token"
     if r.status_code == 402:
         return None, "NoneCap: رصيد غير كافٍ"
     if r.status_code == 429:
-        return None, f"NoneCap rate limit — انتظر {data.get('retry_after', 5)}s"
+        return None, "NoneCap rate limit"
     if r.status_code == 401:
         return None, "NoneCap: المفتاح غير صالح"
-    msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else data.get("message", str(data))
-    return None, f"NoneCap HTTP {r.status_code}: {msg}"
+    return None, f"NoneCap HTTP {r.status_code}"
 
 def _poll_nonecap(solve_id, wait=30):
     if not solve_id:
@@ -120,20 +119,20 @@ def _poll_nonecap(solve_id, wait=30):
             if d.get("token"):
                 return d["token"], None
             if d.get("status") in ("failed", "error"):
-                return None, f"NoneCap فشل: {d}"
+                return None, "NoneCap فشل"
         except Exception:
             continue
     return None, "NoneCap timeout"
 
 # ============================================================
-# CaptchaHandler (discord.py-self) — يستخدم NoneCap
+# CaptchaHandler
 # ============================================================
 class NoneCapHandler(discord.CaptchaHandler):
     def solvecaptcha(self, data, proxy=None, proxy_auth=None):
         sitekey = data.get("captcha_sitekey", "")
         rqdata = data.get("captcha_rqdata", "")
         rqtoken = data.get("captcha_rqtoken", "")
-        log.info(f"CaptchaHandler: sitekey={sitekey[:12]} rqdata={'يوجد' if rqdata else 'لا'} rqtoken={'يوجد' if rqtoken else 'لا'}")
+        log.info(f"CaptchaHandler: sitekey={sitekey[:12]}")
         token, err = solve_nonecap(sitekey, rqdata, rqtoken)
         if token:
             return token
@@ -168,21 +167,48 @@ def self_ping_loop():
         time.sleep(14 * 60)
 
 # ============================================================
-# Telegram
+# Telegram — إرسال آمن مع fallback
 # ============================================================
+def _clean(text):
+    """تنظيف عام لأي نص قبل الإرسال."""
+    try:
+        return str(text)[:4000]
+    except Exception:
+        return "?"
+
+async def _send_one(bot, chat_id, text, md):
+    """يجرّب Markdown، يفشل → نص عادي."""
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=text[:4000],
+            parse_mode=ParseMode.MARKDOWN if md else None,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as e:
+        if md:
+            log.warning(f"Markdown فشل ({type(e).__name__}) — إرسال نص عادي")
+            await bot.send_message(
+                chat_id=chat_id, text=text[:4000],
+                disable_web_page_preview=True,
+            )
+        else:
+            raise
+
 def send_tg(chat_id, text, md=False):
     if not chat_id or not state["tg_loop"] or not state["tg_app"]:
         return
     async def _do():
         try:
-            for i in range(0, len(text), 4000):
-                await state["tg_app"].bot.send_message(
-                    chat_id=chat_id, text=text[i:i+4000],
-                    parse_mode=ParseMode.MARKDOWN if md else None,
-                    disable_web_page_preview=True,
-                )
+            full = _clean(text)
+            # تقسيم ذكي لو طويل
+            chunks = [full[i:i+3900] for i in range(0, len(full), 3900)] or [full]
+            for chunk in chunks:
+                try:
+                    await _send_one(state["tg_app"].bot, chat_id, chunk, md)
+                except Exception as e:
+                    log.error(f"tg send chunk: {e}")
         except Exception as e:
-            log.error(f"tg send: {e}")
+            log.error(f"tg send wrapper: {e}")
     asyncio.run_coroutine_threadsafe(_do(), state["tg_loop"])
 
 def send_tg_doc(chat_id, filename, data, caption=""):
@@ -192,7 +218,10 @@ def send_tg_doc(chat_id, filename, data, caption=""):
         try:
             buf = io.BytesIO(data)
             buf.name = filename
-            await state["tg_app"].bot.send_document(chat_id=chat_id, document=buf, caption=caption[:1000])
+            cap = _clean(caption)[:1000] if caption else ""
+            await state["tg_app"].bot.send_document(
+                chat_id=chat_id, document=buf, caption=cap,
+            )
         except Exception as e:
             log.error(f"tg doc: {e}")
     asyncio.run_coroutine_threadsafe(_do(), state["tg_loop"])
@@ -203,11 +232,12 @@ def notify(text):
         send_tg(chat, text)
 
 # ============================================================
-# Discord login (مسار يدوي احتياطي)
+# Discord login
 # ============================================================
 def _random_ua():
-    chrome = random.choice(["131.0.0.0", "132.0.0.0", "133.0.0.0"])
-    os_part = random.choice([
+    import random as _r
+    chrome = _r.choice(["131.0.0.0", "132.0.0.0", "133.0.0.0"])
+    os_part = _r.choice([
         "Windows NT 10.0; Win64; x64",
         "Macintosh; Intel Mac OS X 10_15_7",
         "X11; Linux x86_64",
@@ -215,18 +245,20 @@ def _random_ua():
     return f"Mozilla/5.0 ({os_part}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome} Safari/537.36"
 
 def _super_properties():
+    import random as _r
+    import base64 as _b
     sp = {
-        "os": random.choice(["Windows", "Mac OS X", "Linux"]),
+        "os": _r.choice(["Windows", "Mac OS X", "Linux"]),
         "browser": "Chrome", "device": "", "system_locale": "en-US",
         "browser_user_agent": _random_ua(), "browser_version": "131.0.0.0",
         "os_version": "10", "referrer": "", "referring_domain": "",
         "referrer_current": "", "referring_domain_current": "",
         "release_channel": "stable",
-        "client_build_number": random.randint(300000, 350000),
+        "client_build_number": _r.randint(300000, 350000),
         "client_event_source": None,
     }
     raw = json.dumps(sp, separators=(",", ":")).encode()
-    return base64.b64encode(raw).decode()
+    return _b.b64encode(raw).decode()
 
 def _login_headers():
     return {
@@ -275,14 +307,14 @@ def api_login(email, password, twofa="", max_retries=2):
                 d2 = r2.json()
                 if "token" in d2:
                     return d2["token"], None
-                return None, f"2FA مرفوض: {d2.get('message', d2)}"
+                return None, "2FA مرفوض"
             except Exception as e:
                 return None, f"2FA: {e}"
         if "captcha_sitekey" in data:
             sitekey = data.get("captcha_sitekey", "")
             rqdata = data.get("captcha_rqdata", "")
             rqtoken = data.get("captcha_rqtoken", "")
-            log.warning(f"CAPTCHA — NoneCap sitekey={sitekey[:12]} rqdata={'يوجد' if rqdata else 'لا'}")
+            log.warning(f"CAPTCHA — NoneCap sitekey={sitekey[:12]}")
             solved, err = solve_nonecap(sitekey, rqdata, rqtoken)
             if not solved:
                 return None, f"فشل حل CAPTCHA: {err}"
@@ -297,11 +329,11 @@ def api_login(email, password, twofa="", max_retries=2):
                 d3 = r3.json()
                 if "token" in d3:
                     return d3["token"], None
-                return None, f"CAPTCHA مرفوض: {d3.get('message', d3)}"
+                return None, f"CAPTCHA مرفوض: {d3.get('captcha_key', ['?'])}"
             except Exception as e:
                 return None, f"retry: {e}"
         if r.status_code in (400, 401):
-            msg = data.get("message", "") or str(data)
+            msg = data.get("message", "") or ""
             if "invalid" in msg.lower() or "credentials" in msg.lower():
                 return None, "الإيميل أو كلمة المرور غير صحيحة"
             last_err = f"HTTP {r.status_code}: {msg}"
@@ -313,7 +345,7 @@ def api_login(email, password, twofa="", max_retries=2):
             last_err = "Rate limit — انتظر"
             time.sleep(20)
             continue
-        last_err = f"HTTP {r.status_code}: {data.get('message', data)}"
+        last_err = f"HTTP {r.status_code}"
         time.sleep(5)
     return None, last_err
 
@@ -541,60 +573,74 @@ async def do_scan(guild_id, chat_id, only_private=False):
 # Telegram handlers
 # ============================================================
 HELP = (
-    "*الأوامر*\n\n"
-    "/private `<guild_id>` — الرومات الخاصة فقط\n"
-    "/scan `<guild_id>` — كل الرومات\n"
-    "/channels `<guild_id>` — تصنيف الرومات\n"
+    "الأوامر:\n\n"
+    "/private <guild_id> — الرومات الخاصة فقط\n"
+    "/scan <guild_id> — كل الرومات\n"
+    "/channels <guild_id> — تصنيف الرومات\n"
     "/status — الحالة\n"
     "/retry_login — إعادة محاولة الدخول\n\n"
-    "لو حطيت `GUILD_ID` في env، تقدر تحذف الآيدي."
+    "لو حطيت GUILD_ID في env، تقدر تحذف الآيدي."
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["default_chat"] = update.effective_chat.id
-    ready = state["discord_ready"]
-    err = f"\n\n⚠️ آخر خطأ:\n`{state['last_error']}`" if state["last_error"] else ""
-    await update.message.reply_text(
-        f"👋 أهلاً\nDiscord: {'✅ جاهز' if ready else '⏳ يتصل...'}{err}\n\n{HELP}",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        state["default_chat"] = update.effective_chat.id
+        ready = state["discord_ready"]
+        lines = [f"👋 أهلاً", f"Discord: {'✅ جاهز' if ready else '⏳ يتصل...'}"]
+        if state["last_error"]:
+            lines.append(f"⚠️ آخر خطأ: {state['last_error']}")
+        lines.append("")
+        lines.append(HELP)
+        text = "\n".join(lines)
+        # إرسال بدون Markdown
+        await update.message.reply_text(text[:4000], disable_web_page_preview=True)
+    except Exception as e:
+        log.error(f"cmd_start: {e}")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP, parse_mode=ParseMode.MARKDOWN)
+    try:
+        await update.message.reply_text(HELP[:4000], disable_web_page_preview=True)
+    except Exception as e:
+        log.error(f"cmd_help: {e}")
 
 async def cmd_retry_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if state["discord_ready"]:
-        await update.message.reply_text("✅ Discord متصل أصلاً")
-        return
-    if not DC_EMAIL or not DC_PASSWORD:
-        await update.message.reply_text("❌ DISCORD_EMAIL أو DISCORD_PASSWORD غير موجود")
-        return
-    await update.message.reply_text("⏳ إعادة محاولة الدخول (NoneCap + rqdata)...")
-    token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
-    if err:
-        state["last_error"] = err
-        await update.message.reply_text(f"❌ {err}")
-        return
-    state["discord_token"] = token
-    if start_discord():
-        await update.message.reply_text("✅ نجح، جاري الاتصال...")
-    else:
-        await update.message.reply_text("❌ التوكن غير صالح")
+    try:
+        if state["discord_ready"]:
+            await update.message.reply_text("✅ Discord متصل أصلاً")
+            return
+        if not DC_EMAIL or not DC_PASSWORD:
+            await update.message.reply_text("❌ DISCORD_EMAIL أو DISCORD_PASSWORD غير موجود")
+            return
+        await update.message.reply_text("⏳ إعادة محاولة الدخول...")
+        token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
+        if err:
+            state["last_error"] = err
+            await update.message.reply_text(f"❌ {err}"[:4000])
+            return
+        state["discord_token"] = token
+        if start_discord():
+            await update.message.reply_text("✅ نجح، جاري الاتصال...")
+        else:
+            await update.message.reply_text("❌ التوكن غير صالح")
+    except Exception as e:
+        log.error(f"cmd_retry_login: {e}")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = state["discord_bot"]
-    ready = bot and state["discord_ready"]
-    lines = [
-        f"*Discord:* {'✅' if ready else '❌'}",
-        f"*النوع:* {state['token_type'] or '—'}",
-        f"*الحساب:* {bot.user if ready else '—'}",
-        f"*فحص جاري:* {'نعم' if state['scanning'] else 'لا'}",
-        f"*NoneCap:* {'✅ مفتاح موجود' if NONECAP_KEY else '❌ لا مفتاح'}",
-        f"*CaptchaHandler:* {'✅ مفعّل' if state['token_type'] == 'user' else '—'}",
-    ]
-    if state["last_error"]:
-        lines.append(f"*آخر خطأ:*\n`{state['last_error']}`")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    try:
+        bot = state["discord_bot"]
+        ready = bot and state["discord_ready"]
+        lines = [
+            f"Discord: {'✅' if ready else '❌'}",
+            f"النوع: {state['token_type'] or '—'}",
+            f"الحساب: {bot.user if ready else '—'}",
+            f"فحص جاري: {'نعم' if state['scanning'] else 'لا'}",
+            f"NoneCap: {'✅' if NONECAP_KEY else '❌'}",
+        ]
+        if state["last_error"]:
+            lines.append(f"آخر خطأ: {state['last_error']}")
+        await update.message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+    except Exception as e:
+        log.error(f"cmd_status: {e}")
 
 async def _resolve_guild(context):
     if context.args:
@@ -610,104 +656,132 @@ async def _resolve_guild(context):
     return None, "أرسل الأمر مع آيدي السيرفر"
 
 async def cmd_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["default_chat"] = update.effective_chat.id
-    if state["scanning"]:
-        await update.message.reply_text("⏳ فيه فحص جاري")
-        return
-    if not state["discord_ready"]:
-        await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
-        return
-    gid, err = await _resolve_guild(context)
-    if err:
-        await update.message.reply_text(err)
-        return
-    asyncio.run_coroutine_threadsafe(
-        do_scan(gid, update.effective_chat.id, only_private=True),
-        state["discord_loop"],
-    )
-    await update.message.reply_text("▶️ بدء فحص الرومات الخاصة...")
+    try:
+        state["default_chat"] = update.effective_chat.id
+        if state["scanning"]:
+            await update.message.reply_text("⏳ فيه فحص جاري")
+            return
+        if not state["discord_ready"]:
+            await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
+            return
+        gid, err = await _resolve_guild(context)
+        if err:
+            await update.message.reply_text(err)
+            return
+        asyncio.run_coroutine_threadsafe(
+            do_scan(gid, update.effective_chat.id, only_private=True),
+            state["discord_loop"],
+        )
+        await update.message.reply_text("▶️ بدء فحص الرومات الخاصة...")
+    except Exception as e:
+        log.error(f"cmd_private: {e}")
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["default_chat"] = update.effective_chat.id
-    if state["scanning"]:
-        await update.message.reply_text("⏳ فيه فحص جاري")
-        return
-    if not state["discord_ready"]:
-        await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
-        return
-    gid, err = await _resolve_guild(context)
-    if err:
-        await update.message.reply_text(err)
-        return
-    asyncio.run_coroutine_threadsafe(
-        do_scan(gid, update.effective_chat.id, only_private=False),
-        state["discord_loop"],
-    )
-    await update.message.reply_text("▶️ بدء فحص كل الرومات...")
+    try:
+        state["default_chat"] = update.effective_chat.id
+        if state["scanning"]:
+            await update.message.reply_text("⏳ فيه فحص جاري")
+            return
+        if not state["discord_ready"]:
+            await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
+            return
+        gid, err = await _resolve_guild(context)
+        if err:
+            await update.message.reply_text(err)
+            return
+        asyncio.run_coroutine_threadsafe(
+            do_scan(gid, update.effective_chat.id, only_private=False),
+            state["discord_loop"],
+        )
+        await update.message.reply_text("▶️ بدء فحص كل الرومات...")
+    except Exception as e:
+        log.error(f"cmd_scan: {e}")
 
 async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["default_chat"] = update.effective_chat.id
-    if not state["discord_ready"]:
-        await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
-        return
-    gid, err = await _resolve_guild(context)
-    if err:
-        await update.message.reply_text(err)
-        return
-    async def _list():
-        bot = state["discord_bot"]
-        guild = bot.get_guild(gid)
-        if guild is None:
+    try:
+        state["default_chat"] = update.effective_chat.id
+        if not state["discord_ready"]:
+            await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
+            return
+        gid, err = await _resolve_guild(context)
+        if err:
+            await update.message.reply_text(err)
+            return
+
+        async def _list():
             try:
-                guild = await bot.fetch_guild(gid)
+                bot = state["discord_bot"]
+                guild = bot.get_guild(gid)
+                if guild is None:
+                    try:
+                        guild = await bot.fetch_guild(gid)
+                    except Exception as e:
+                        send_tg(update.effective_chat.id, f"❌ {e}")
+                        return
+                private = [c for c in guild.text_channels if is_private_channel(c, guild)]
+                public = [c for c in guild.text_channels if not is_private_channel(c, guild)]
+                lines = [f"🏰 {guild.name}", f"🔒 خاصة: {len(private)} | 🌐 عامة: {len(public)}", ""]
+                if private:
+                    lines.append("🔒 الخاصة:")
+                    for c in private[:30]:
+                        lines.append(f"• #{c.name} ({c.id})")
+                    if len(private) > 30:
+                        lines.append(f"... و{len(private)-30}")
+                    lines.append("")
+                if public:
+                    lines.append("🌐 العامة:")
+                    for c in public[:20]:
+                        lines.append(f"• #{c.name}")
+                    if len(public) > 20:
+                        lines.append(f"... و{len(public)-20}")
+                send_tg(update.effective_chat.id, "\n".join(lines))
             except Exception as e:
-                send_tg(update.effective_chat.id, f"❌ {e}")
-                return
-        private = [c for c in guild.text_channels if is_private_channel(c, guild)]
-        public = [c for c in guild.text_channels if not is_private_channel(c, guild)]
-        lines = [f"*🏰 {guild.name}*", f"🔒 خاصة: {len(private)} | 🌐 عامة: {len(public)}", ""]
-        if private:
-            lines.append("*🔒 الخاصة:*")
-            for c in private[:30]:
-                lines.append(f"• #{c.name} (`{c.id}`)")
-            if len(private) > 30:
-                lines.append(f"... و{len(private)-30}")
-            lines.append("")
-        if public:
-            lines.append("*🌐 العامة:*")
-            for c in public[:20]:
-                lines.append(f"• #{c.name}")
-            if len(public) > 20:
-                lines.append(f"... و{len(public)-20}")
-        send_tg(update.effective_chat.id, "\n".join(lines), md=True)
-    asyncio.run_coroutine_threadsafe(_list(), state["discord_loop"])
-    await update.message.reply_text("📋 جاري الجلب...")
+                log.error(f"list: {e}")
+
+        asyncio.run_coroutine_threadsafe(_list(), state["discord_loop"])
+        await update.message.reply_text("📋 جاري الجلب...")
+    except Exception as e:
+        log.error(f"cmd_channels: {e}")
+
+async def on_error(update, context):
+    log.error(f"tg handler error: {context.error}")
+    try:
+        if update and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ خطأ: {context.error}"[:4000],
+            )
+    except Exception:
+        pass
 
 # ============================================================
 # post_init
 # ============================================================
 async def post_init(app: Application):
-    state["tg_loop"] = asyncio.get_running_loop()
-    state["tg_app"] = app
-    log.info("✅ Telegram جاهز")
+    try:
+        state["tg_loop"] = asyncio.get_running_loop()
+        state["tg_app"] = app
+        log.info("✅ Telegram جاهز")
 
-    if state["discord_token"]:
-        if start_discord():
-            log.info("⏳ Discord auto-start (توكن)")
-    elif DC_EMAIL and DC_PASSWORD:
-        notify("🔐 جاري تسجيل الدخول إلى Discord...")
-        token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
-        if token:
-            state["discord_token"] = token
-            state["last_error"] = None
+        if state["discord_token"]:
             if start_discord():
-                log.info("✅ auto login نجح")
+                log.info("⏳ Discord auto-start (توكن)")
+        elif DC_EMAIL and DC_PASSWORD:
+            notify("🔐 جاري تسجيل الدخول إلى Discord...")
+            token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
+            if token:
+                state["discord_token"] = token
+                state["last_error"] = None
+                if start_discord():
+                    log.info("✅ auto login نجح")
+            else:
+                state["last_error"] = err
+                log.error(f"auto login: {err}")
+                notify(f"❌ فشل تسجيل دخول Discord: {err}")
         else:
-            state["last_error"] = err
-            log.error(f"auto login: {err}")
-            notify(f"❌ فشل تسجيل دخول Discord:\n{err}")
-    else:
-        notify("⚠️ ما فيه DISCORD_EMAIL أو DISCORD_PASSWORD")
+            notify("⚠️ ما فيه DISCORD_EMAIL أو DISCORD_PASSWORD")
+    except Exception as e:
+        log.error(f"post_init: {e}")
 
 # ============================================================
 def main():
@@ -726,9 +800,10 @@ def main():
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("channels", cmd_channels))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_error_handler(on_error)
 
     log.info("🤖 Telegram polling...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
