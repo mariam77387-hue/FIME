@@ -53,9 +53,11 @@ DC_TOKEN      = os.getenv("DISCORD_TOKEN", "").strip()
 DC_EMAIL      = os.getenv("DISCORD_EMAIL", "").strip()
 DC_PASSWORD   = os.getenv("DISCORD_PASSWORD", "").strip()
 DC_2FA        = os.getenv("DISCORD_2FA", "").strip()
-NONECAP_KEY   = os.getenv("NONECAP_API_KEY", "").strip()  # اختياري مجاني
 DEFAULT_GUILD = os.getenv("GUILD_ID", "").strip()
 RENDER_URL    = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+
+# NoneCap — المفتاح اللي أرسلته كقيمة افتراضية
+NONECAP_KEY = os.getenv("NONECAP_API_KEY", "").strip() or "nc_live_OIWI2jryLCq_-yhorZBwpzft3NwXxjiQ"
 
 state = {
     "discord_token": DC_TOKEN or None,
@@ -71,8 +73,89 @@ state = {
 }
 
 # ============================================================
-# hCaptcha Accessibility Cookie Bypass (مجاني، بدون مفتاح)
-# المصدر: avengy/hcaptcha-bypass-discord
+# NoneCap — endpoint الرسمي
+# ============================================================
+def solve_nonecap(sitekey, url="https://discord.com/login", wait=30):
+    """
+    يستخدم POST /v1/solves?wait=30
+    Authorization: Bearer <key>
+    body: {type, sitekey, url}
+    يرجع token أو None + سبب
+    """
+    if not NONECAP_KEY:
+        return None, "NONECAP_API_KEY غير موجود"
+
+    try:
+        r = requests.post(
+            f"https://api.nonecap.com/v1/solves?wait={wait}",
+            headers={
+                "Authorization": f"Bearer {NONECAP_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "type": "hcaptcha",
+                "sitekey": sitekey,
+                "url": url,
+            },
+            timeout=wait + 30,
+        )
+    except Exception as e:
+        return None, f"NoneCap اتصال: {e}"
+
+    try:
+        data = r.json()
+    except Exception:
+        return None, f"NoneCap HTTP {r.status_code} (رد غير JSON)"
+
+    log.info(f"NoneCap HTTP {r.status_code} keys={list(data.keys()) if isinstance(data, dict) else '?'}")
+
+    if r.status_code == 200:
+        token = data.get("token")
+        if token:
+            log.info("✅ NoneCap حَلّ CAPTCHA")
+            return token, None
+        # ممكن يكون pending لو wait ما كفى
+        if data.get("status") == "pending":
+            solve_id = data.get("id")
+            return _poll_nonecap(solve_id, wait)
+        return None, f"NoneCap رد بدون token: {data}"
+
+    if r.status_code == 402:
+        return None, "NoneCap: رصيد غير كافٍ"
+    if r.status_code == 429:
+        retry = data.get("retry_after", 5) if isinstance(data, dict) else 5
+        return None, f"NoneCap rate limit — انتظر {retry}s"
+    if r.status_code == 401:
+        return None, "NoneCap: المفتاح غير صالح"
+
+    msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else data.get("message", str(data))
+    return None, f"NoneCap HTTP {r.status_code}: {msg}"
+
+def _poll_nonecap(solve_id, wait=30):
+    """إذا الرد الأول pending، نكمل polling."""
+    if not solve_id:
+        return None, "NoneCap: لا يوجد id للمتابعة"
+    for _ in range(10):
+        time.sleep(5)
+        try:
+            r = requests.get(
+                f"https://api.nonecap.com/v1/solves/{solve_id}?wait={wait}",
+                headers={"Authorization": f"Bearer {NONECAP_KEY}"},
+                timeout=wait + 30,
+            )
+            d = r.json()
+            if d.get("token"):
+                return d["token"], None
+            if d.get("status") in ("failed", "error"):
+                return None, f"NoneCap فشل: {d}"
+            if d.get("status") == "solved" and d.get("token"):
+                return d["token"], None
+        except Exception:
+            continue
+    return None, "NoneCap timeout"
+
+# ============================================================
+# hCaptcha Accessibility (خطة بديلة)
 # ============================================================
 _HC_HEADERS = {
     "Host": "hcaptcha.com",
@@ -96,12 +179,12 @@ _HC_COOKIES = {
         "05vRrjPBkaNVKqg1RcpcfREQ06gIS9YzkItTt+2z/aHHZU1rAdJTyJ8oijsq2Mis23zqp9EWQ52H4oWE"
         "stionkOct9Z8NgybESmrdNsowi3NXNOoVwWoU4ZEwGCbjG8eO+2HnSP1vPKUi6tT7Z39E2eCMAJJDn9d"
         "yenkOuFRcOMmFiMIIIFsTUniyM7EhvSWxWDFvI+4zbx/+TP5pQClZJcLbXinpw1SMk3GVT3S6EG2n/Dy"
-        "LQ0/p3+/CJYbr7sVjdeRLQBGyCMvaOPy+dvaRH+mszz58EoV35sq9835SPRD17jNym9E=UCa12gEu9VI"
+        "LQ0/p3+/CJYbr7sVjdeRLABGyCMvaOPy+dvaRH+mszz58EoV35sq9835SPRD17jNym9E=UCa12gEu9VI"
         "PScd9"
     )
 }
 
-def _hc_n_data(req: dict) -> str:
+def _hc_n_data(req: dict):
     try:
         x = "0123456789/:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
         req = req.split(".")
@@ -193,8 +276,7 @@ def _hc_get_captcha(host, sitekey, n, req):
         log.warning(f"hcaptcha getcaptcha: {e}")
         return {}
 
-def solve_captcha_free(sitekey: str, host: str = "discord.com"):
-    """الطريقة المجانية الأولى: accessibility cookie."""
+def solve_accessibility(sitekey, host="discord.com"):
     try:
         req = _hc_req_data(host, sitekey)
         if not req:
@@ -205,42 +287,25 @@ def solve_captcha_free(sitekey: str, host: str = "discord.com"):
             return None, "hash فشل"
         res = _hc_get_captcha(host, sitekey, n, req)
         if isinstance(res, dict) and res.get("generated_pass_UUID"):
-            log.info("✅ hCaptcha حُلّ مجاناً (accessibility)")
+            log.info("✅ accessibility حَلّ CAPTCHA")
             return res["generated_pass_UUID"], None
         return None, "generated_pass_UUID غير موجود"
     except Exception as e:
         return None, f"accessibility: {e}"
 
 # ============================================================
-# NoneCap (اختياري — 100 حل مجاني/يوم عند التسجيل)
+# المنسق: NoneCap أولاً، ثم accessibility
 # ============================================================
-def solve_nonecap(sitekey, url="https://discord.com/login"):
-    if not NONECAP_KEY:
-        return None, "NONECAP_API_KEY غير موجود"
-    try:
-        r = requests.post(
-            "https://api.nonecap.com/solve",
-            headers={"Authorization": f"Bearer {NONECAP_KEY}", "Content-Type": "application/json"},
-            json={"type": "hcaptcha", "sitekey": sitekey, "url": url},
-            timeout=120,
-        )
-        j = r.json()
-        if j.get("token"):
-            return j["token"], None
-        return None, j.get("error", "NoneCap فشل")
-    except Exception as e:
-        return None, f"NoneCap: {e}"
-
 def solve_captcha(sitekey, host="discord.com"):
-    """يجرّب المجاني أولاً، ثم NoneCap إذا توفر."""
-    token, err = solve_captcha_free(sitekey, host)
+    if NONECAP_KEY:
+        token, err = solve_nonecap(sitekey)
+        if token:
+            return token, None
+        log.warning(f"NoneCap فشل: {err} — تجربة accessibility")
+    token, err = solve_accessibility(sitekey, host)
     if token:
         return token, None
-    log.warning(f"accessibility فشل: {err}")
-    token2, err2 = solve_nonecap(sitekey)
-    if token2:
-        return token2, None
-    return None, f"كل الطرق فشلت — accessibility: {err} | NoneCap: {err2}"
+    return None, err
 
 # =========================
 # Flask
@@ -340,7 +405,7 @@ def _login_headers():
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-def api_login(email, password, twofa="", max_retries=2):
+def api_login(email, password, twofa="", max_retries=3):
     payload = {
         "login": email, "password": password, "undelete": False,
         "captcha_key": None, "login_source": None, "gift_code_sku_id": None,
@@ -388,17 +453,17 @@ def api_login(email, password, twofa="", max_retries=2):
             except Exception as e:
                 return None, f"2FA: {e}"
 
-        # CAPTCHA — هنا الحل المجاني
+        # CAPTCHA — NoneCap أولاً
         if "captcha_sitekey" in data or data.get("captcha_service") == "hcaptcha":
             sitekey = data.get("captcha_sitekey", "")
-            log.warning(f"CAPTCHA مطلوب — محاولة حل مجاني (sitekey={sitekey[:12]}...)")
+            log.warning(f"CAPTCHA — NoneCap (sitekey={sitekey[:12]}...)")
 
             solved, err = solve_captcha(sitekey, "discord.com")
             if not solved:
                 return None, (
-                    f"CAPTCHA مطلوب. الحل المجاني فشل:\n{err}\n\n"
-                    "البديل المجاني: سجّل في nonecap.com (100 حل/يوم مجاناً)،\n"
-                    "انسخ API key، وحطه في NONECAP_API_KEY."
+                    f"CAPTCHA فشل حلّه.\n"
+                    f"السبب: {err}\n\n"
+                    "تأكد إن مفتاح NoneCap صحيح وعنده رصيد مجاني متبقي (100/يوم)."
                 )
 
             headers2 = dict(headers)
@@ -709,7 +774,7 @@ async def cmd_retry_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not DC_EMAIL or not DC_PASSWORD:
         await update.message.reply_text("❌ DISCORD_EMAIL أو DISCORD_PASSWORD غير موجود")
         return
-    await update.message.reply_text("⏳ إعادة محاولة الدخول (مع الحل المجاني)...")
+    await update.message.reply_text("⏳ إعادة محاولة الدخول (NoneCap)...")
     token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
     if err:
         state["last_error"] = err
@@ -729,6 +794,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*النوع:* {state['token_type'] or '—'}",
         f"*الحساب:* {bot.user if ready else '—'}",
         f"*فحص جاري:* {'نعم' if state['scanning'] else 'لا'}",
+        f"*NoneCap:* {'✅ مفتاح موجود' if NONECAP_KEY else '❌ لا مفتاح'}",
     ]
     if state["last_error"]:
         lines.append(f"*آخر خطأ:*\n`{state['last_error']}`")
