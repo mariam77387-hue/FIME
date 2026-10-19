@@ -1,152 +1,241 @@
 import os
+import sys
 import asyncio
-import discord
+import logging
+from datetime import datetime
 
-# ====== الإعدادات ======
-TOKEN = os.getenv("DISCORD_TOKEN")
-MESSAGE_LIMIT = 100  # عدد الرسائل لكل روم خاص (تقدر تغيره)
+import discord
+from discord.ext import commands
+
+# =========================
+# الإعدادات
+# =========================
+TOKEN = os.getenv("DISCORD_TOKEN")          # حط التوكن في Secrets باسم DISCORD_TOKEN
+GUILD_ID_ENV = os.getenv("GUILD_ID")        # اختياري: تقدر تحط الآيدي في البيئة بعد
+DEFAULT_LIMIT = None                        # None = كل الرسائل. حط رقم لو تبي تسرع
+RETRY_ON_429 = 5                            # كم مرة يعيد المحاولة عند rate limit
+BASE_DELAY = 2.5                            # ثواني الانتظار الأساسية
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("scanner")
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
-client = discord.Client(intents=intents)
-scanned = False  # عشان ما يتكرر الفحص لو صار reconnect
+bot = commands.Bot(command_prefix="!", intents=intents, self_bot=False)
 
 
-def is_private_channel(channel: discord.TextChannel, guild: discord.Guild) -> bool:
+# =========================
+# أدوات مساعدة
+# =========================
+def format_author(message: discord.Message) -> str:
+    """اسم الكاتب + الآيدي + اللقب إن وجد."""
+    author = message.author
+    name = getattr(author, "name", "unknown")
+    disc = getattr(author, "discriminator", "0")
+    if disc and disc != "0":
+        name = f"{name}#{disc}"
+    display = getattr(author, "display_name", None)
+    if display and display != name:
+        return f"{name} ({display}) [{author.id}]"
+    return f"{name} [{author.id}]"
+
+
+def format_message(message: discord.Message) -> str:
+    """صياغة رسالة واحدة بشكل مقروء."""
+    ts = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"[{ts}] {format_author(message)}: {message.content or '[بدون نص]'}"]
+
+    if message.attachments:
+        for att in message.attachments:
+            lines.append(f"    📎 مرفق: {att.filename} — {att.url}")
+
+    if message.embeds:
+        for i, emb in enumerate(message.embeds, 1):
+            title = emb.title or "(بدون عنوان)"
+            desc = (emb.description or "")[:200]
+            lines.append(f"    🧩 Embed {i}: {title} — {desc}")
+
+    if message.reactions:
+        rs = ", ".join(f"{r.emoji}×{r.count}" for r in message.reactions)
+        lines.append(f"    ✨ تفاعلات: {rs}")
+
+    if message.reference:
+        lines.append(f"    ↩️ رد على رسالة ID: {message.reference.message_id}")
+
+    return "\n".join(lines)
+
+
+async def safe_history(channel: discord.TextChannel, limit=None):
     """
-    الروم يعتبر خاص إذا صلاحية view_channel للرول @everyone
-    متعطلة صراحة (False). إذا ما فيه overwrite، يعتبر عام.
+    جلب تاريخ الروم مع إعادة محاولة عند 429.
+    يرجع list من الرسائل مرتبة من الأقدم للأحدث.
     """
-    try:
-        overwrites = channel.overwrites_for(guild.default_role)
-        return overwrites.view_channel is False
-    except Exception:
-        return False
+    messages = []
+    attempt = 0
+
+    while True:
+        try:
+            async for msg in channel.history(limit=limit, oldest_first=True):
+                messages.append(msg)
+            return messages
+
+        except discord.Forbidden:
+            log.warning(f"🔒 لا توجد صلاحية لقراءة #{channel.name} ({channel.id}) — تم التخطي.")
+            return []
+
+        except discord.HTTPException as e:
+            if e.status == 429:
+                attempt += 1
+                if attempt > RETRY_ON_429:
+                    log.error(f"⛔ تجاوزت حد إعادة المحاولة في #{channel.name}. تم التخطي.")
+                    return messages
+                wait = BASE_DELAY * attempt
+                log.warning(f"⏳ Rate limit في #{channel.name}. انتظار {wait:.1f}s (محاولة {attempt}).")
+                await asyncio.sleep(wait)
+                continue
+            log.error(f"⚠️ HTTP {e.status} في #{channel.name}: {e.text or e}")
+            return messages
+
+        except Exception as e:
+            log.error(f"⚠️ خطأ غير متوقع في #{channel.name}: {type(e).__name__}: {e}")
+            return messages
 
 
-async def dump_channel_messages(channel: discord.TextChannel, limit: int = 100):
-    """يطبع رسائل الروم الخاص مع الوقت والكاتب والمرفقات."""
-    print(f"\n{'='*60}")
-    print(f"🔒 الروم الخاص: #{channel.name}  |  ID: {channel.id}")
-    print(f"{'='*60}")
+async def scan_guild(guild: discord.Guild, limit=None):
+    """يفحص كل الرومات النصية ويطبع رسائل اللي يقدر يوصلها."""
+    print(f"\n{'='*70}")
+    print(f"🏰 السيرفر: {guild.name}  |  ID: {guild.id}")
+    print(f"👥 الأعضاء: {guild.member_count or 'غير معروف'}")
+    print(f"📚 عدد الرومات النصية: {len(guild.text_channels)}")
+    print(f"{'='*70}\n")
 
-    try:
-        async for message in channel.history(limit=limit):
-            ts = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            author = message.author.name
-            if getattr(message.author, "discriminator", "0") != "0":
-                author += f"#{message.author.discriminator}"
+    readable = []
+    blocked = []
 
-            content = message.content or "[بدون نص]"
-            print(f"[{ts}] {author}: {content}")
+    for ch in guild.text_channels:
+        # نحاول نجيب رسالة واحدة بس عشان نعرف هل عندنا صلاحية
+        try:
+            await ch.history(limit=1).flatten()
+            readable.append(ch)
+        except discord.Forbidden:
+            blocked.append(ch)
+        except Exception:
+            blocked.append(ch)
 
-            if message.attachments:
-                for att in message.attachments:
-                    print(f"    📎 مرفق: {att.url}")
+    print(f"✅ رومات قابلة للقراءة: {len(readable)}")
+    print(f"🚫 رومات محجوبة: {len(blocked)}")
+    if blocked:
+        print("   (البوت ما يقدر يشوف هذي الرومات — قيد من Discord، مو من الكود)")
 
-            if message.reactions:
-                reactions = ", ".join(f"{r.emoji}×{r.count}" for r in message.reactions)
-                print(f"    ✨ تفاعلات: {reactions}")
+    print("\n--- الرومات المحجوبة ---")
+    for ch in blocked:
+        print(f"  🚫 #{ch.name}  |  ID: {ch.id}")
 
-    except discord.Forbidden:
-        print("  ⚠️ ما عندك صلاحية قراءة رسائل هذا الروم.")
-    except discord.HTTPException as e:
-        print(f"  ⚠️ خطأ HTTP أثناء جلب الرسائل: {e}")
-    except Exception as e:
-        print(f"  ⚠️ خطأ غير متوقع: {e}")
+    print("\n\n📥 جاري سحب الرسائل من الرومات القابلة للقراءة...\n")
 
+    all_messages = []
 
-async def scan_guild(guild_id: int):
-    """الدالة الرئيسية: تجيب السيرفر، تصنف الرومات، وتطبع رسائل الخاصة."""
-    print(f"\n⏳ جاري جلب السيرفر {guild_id} ...")
+    for idx, ch in enumerate(readable, 1):
+        print(f"\n{'─'*70}")
+        print(f"📂 ({idx}/{len(readable)}) #{ch.name}  |  ID: {ch.id}")
+        print(f"{'─'*70}")
 
-    try:
-        guild = await client.fetch_guild(guild_id)
-    except discord.NotFound:
-        print("❌ السيرفر غير موجود، أو حسابك مو عضو فيه.")
-        return
-    except discord.Forbidden:
-        print("❌ ما عندك صلاحية الوصول لهذا السيرفر.")
-        return
-    except Exception as e:
-        print(f"❌ خطأ أثناء جلب السيرفر: {e}")
-        return
+        msgs = await safe_history(ch, limit=limit)
+        if not msgs:
+            print("  (لا توجد رسائل أو لا توجد صلاحية)")
+            continue
 
-    print(f"✅ السيرفر: {guild.name}  |  ID: {guild.id}")
-    print("🔎 جاري فحص الرومات النصية ...\n")
+        for m in msgs:
+            print(format_message(m))
+            all_messages.append(m)
 
-    private_channels = []
-    public_channels = []
+        log.info(f"تم سحب {len(msgs)} رسالة من #{ch.name}")
+        await asyncio.sleep(0.6)  # تأخير بسيط بين الرومات
 
-    for channel in guild.text_channels:
-        if is_private_channel(channel, guild):
-            private_channels.append(channel)
-        else:
-            public_channels.append(channel)
+    # ترتيب كل الرسائل زمنياً
+    if all_messages:
+        all_messages.sort(key=lambda m: m.created_at)
+        print(f"\n\n{'='*70}")
+        print(f"📊 الإجمالي: {len(all_messages)} رسالة من {len(readable)} روم")
+        print(f"⏱️ من {all_messages[0].created_at:%Y-%m-%d %H:%M} إلى {all_messages[-1].created_at:%Y-%m-%d %H:%M}")
+        print(f"{'='*70}")
 
-    print(f"📊 النتيجة: {len(private_channels)} روم خاص  |  {len(public_channels)} روم عام")
-
-    print("\n--- قائمة الرومات الخاصة ---")
-    if private_channels:
-        for ch in private_channels:
-            print(f"  🔒 #{ch.name}  |  ID: {ch.id}")
+        # حفظ نسخة نصية احتياطية
+        try:
+            with open("messages_dump.txt", "w", encoding="utf-8") as f:
+                for m in all_messages:
+                    f.write(format_message(m) + "\n\n")
+            log.info("تم حفظ نسخة في messages_dump.txt")
+        except Exception as e:
+            log.warning(f"تعذر حفظ الملف: {e}")
     else:
-        print("  (ما فيه رومات خاصة)")
-
-    print("\n--- قائمة الرومات العامة (بدون رسائل) ---")
-    if public_channels:
-        for ch in public_channels:
-            print(f"  🌐 #{ch.name}  |  ID: {ch.id}")
-    else:
-        print("  (ما فيه رومات عامة)")
-
-    if not private_channels:
-        print("\n⏭️ ما فيه رومات خاصة، تم تخطي جلب الرسائل.")
-        return
-
-    print("\n\n📥 جاري جلب رسائل الرومات الخاصة ...")
-    for ch in private_channels:
-        await dump_channel_messages(ch, limit=MESSAGE_LIMIT)
-        await asyncio.sleep(0.7)  # تأخير بسيط لتجنب rate limit
+        print("\n⚠️ ما فيه رسائل تم سحبها.")
 
 
-@client.event
+@bot.event
 async def on_ready():
-    global scanned
-    if scanned:
-        return
-    scanned = True
+    print(f"\n✅ تم تسجيل الدخول كـ {bot.user}  |  ID: {bot.user.id}")
 
-    print(f"\n✅ تم تسجيل الدخول: {client.user}  |  ID: {client.user.id}")
+    guild_id_raw = GUILD_ID_ENV
+    if not guild_id_raw:
+        try:
+            guild_id_raw = input("\n🔢 أدخل آيدي السيرفر: ").strip()
+        except Exception:
+            guild_id_raw = ""
 
-    guild_id_raw = input("\n🔢 أدخل آيدي السيرفر: ").strip()
     try:
         guild_id = int(guild_id_raw)
-    except ValueError:
-        print("❌ آيدي غير صالح. لازم يكون أرقام فقط.")
-        await client.close()
-        return
-
-    await scan_guild(guild_id)
-
-    print("\n🏁 انتهى الفحص. جاري إغلاق الاتصال ...")
-    await client.close()
-
-
-async def main():
-    if not TOKEN:
-        print("❌ التوكن غير موجود. حط DISCORD_TOKEN في Secrets أو متغيرات البيئة.")
+    except (ValueError, TypeError):
+        log.error("❌ آيدي السيرفر غير صالح. لازم يكون أرقام فقط.")
+        await bot.close()
         return
 
     try:
-        await client.start(TOKEN)
-    except discord.LoginFailure:
-        print("❌ التوكن غلط أو منتهي.")
+        guild = await bot.fetch_guild(guild_id)
+    except discord.NotFound:
+        log.error("❌ السيرفر غير موجود، أو البوت مو عضو فيه.")
+        await bot.close()
+        return
+    except discord.Forbidden:
+        log.error("❌ البوت ما عنده صلاحية الوصول لهذا السيرفر.")
+        await bot.close()
+        return
     except Exception as e:
-        print(f"❌ خطأ أثناء الاتصال: {e}")
+        log.error(f"❌ خطأ أثناء جلب السيرفر: {type(e).__name__}: {e}")
+        await bot.close()
+        return
+
+    try:
+        await scan_guild(guild, limit=DEFAULT_LIMIT)
+    except Exception as e:
+        log.error(f"❌ خطأ أثناء الفحص: {type(e).__name__}: {e}")
+    finally:
+        print("\n🏁 انتهى الفحص. إغلاق الاتصال...")
+        await bot.close()
+
+
+def main():
+    if not TOKEN:
+        log.error("❌ التوكن غير موجود. حط DISCORD_TOKEN في Secrets أو متغيرات البيئة.")
+        sys.exit(1)
+
+    try:
+        bot.run(TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        log.error("❌ التوكن غلط أو منتهي.")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        log.info("تم الإيقاف يدوياً.")
+    except Exception as e:
+        log.error(f"❌ خطأ أثناء التشغيل: {type(e).__name__}: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
