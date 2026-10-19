@@ -4,6 +4,9 @@ import types
 import io
 import time
 import json
+import base64
+import random
+import string
 import asyncio
 import threading
 import logging
@@ -40,18 +43,20 @@ logging.basicConfig(
 log = logging.getLogger("scan")
 
 API_BASE = "https://discord.com/api/v9"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/131.0.0.0 Safari/537.36")
 
-TG_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DC_TOKEN     = os.getenv("DISCORD_TOKEN", "").strip()
-DC_EMAIL     = os.getenv("DISCORD_EMAIL", "").strip()
-DC_PASSWORD  = os.getenv("DISCORD_PASSWORD", "").strip()
-DC_2FA       = os.getenv("DISCORD_2FA", "").strip()
+# =========================
+# متغيرات البيئة
+# =========================
+TG_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DC_TOKEN      = os.getenv("DISCORD_TOKEN", "").strip()
+DC_EMAIL      = os.getenv("DISCORD_EMAIL", "").strip()
+DC_PASSWORD   = os.getenv("DISCORD_PASSWORD", "").strip()
+DC_2FA        = os.getenv("DISCORD_2FA", "").strip()
+CAPTCHA_KEY   = os.getenv("CAPTCHA_API_KEY", "").strip()   # 2captcha
+PROXY_URL     = os.getenv("PROXY_URL", "").strip()          # http://user:pass@ip:port
 DEFAULT_GUILD = os.getenv("GUILD_ID", "").strip()
-RENDER_URL   = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+RENDER_URL    = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
 state = {
     "discord_token": DC_TOKEN or None,
@@ -64,7 +69,6 @@ state = {
     "default_chat": int(TG_CHAT_ID) if TG_CHAT_ID.isdigit() else None,
     "scanning": False,
     "last_error": None,
-    "login_attempts": 0,
 }
 
 # =========================
@@ -128,22 +132,101 @@ def notify(text):
         send_tg(chat, text)
 
 # =========================
-# Discord login — الإصلاح هنا
+# CAPTCHA solver (2captcha)
 # =========================
+def solve_hcaptcha(sitekey, rqdata="", rqtoken="", page_url="https://discord.com/login"):
+    if not CAPTCHA_KEY:
+        return None, "CAPTCHA_API_KEY غير موجود"
+    try:
+        # submit
+        payload = {
+            "key": CAPTCHA_KEY,
+            "method": "hcaptcha",
+            "sitekey": sitekey,
+            "pageurl": page_url,
+            "json": 1,
+        }
+        if rqdata:
+            payload["data"] = rqdata
+        if rqtoken:
+            payload["rqtoken"] = rqtoken
+        r = requests.post("https://2captcha.com/in.php", data=payload, timeout=30)
+        j = r.json()
+        if j.get("status") != 1:
+            return None, f"2captcha submit: {j.get('request')}"
+        task_id = j["request"]
+        # poll
+        for _ in range(30):
+            time.sleep(5)
+            r2 = requests.get(
+                "https://2captcha.com/res.php",
+                params={"key": CAPTCHA_KEY, "action": "get", "id": task_id, "json": 1},
+                timeout=30,
+            )
+            j2 = r2.json()
+            if j2.get("status") == 1:
+                return j2["request"], None
+            if j2.get("request") != "CAPCHA_NOT_READY":
+                return None, f"2captcha: {j2.get('request')}"
+        return None, "2captcha timeout"
+    except Exception as e:
+        return None, f"2captcha: {e}"
+
+# =========================
+# Discord login
+# =========================
+def _random_ua():
+    chrome = random.choice(["131.0.0.0", "132.0.0.0", "133.0.0.0"])
+    os_part = random.choice([
+        "Windows NT 10.0; Win64; x64",
+        "Macintosh; Intel Mac OS X 10_15_7",
+        "X11; Linux x86_64",
+    ])
+    return (
+        f"Mozilla/5.0 ({os_part}) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{chrome} Safari/537.36"
+    )
+
+def _super_properties():
+    sp = {
+        "os": random.choice(["Windows", "Mac OS X", "Linux"]),
+        "browser": "Chrome",
+        "device": "",
+        "system_locale": "en-US",
+        "browser_user_agent": _random_ua(),
+        "browser_version": "131.0.0.0",
+        "os_version": "10",
+        "referrer": "",
+        "referring_domain": "",
+        "referrer_current": "",
+        "referring_domain_current": "",
+        "release_channel": "stable",
+        "client_build_number": random.randint(300000, 350000),
+        "client_event_source": None,
+    }
+    raw = json.dumps(sp, separators=(",", ":")).encode()
+    return base64.b64encode(raw).decode()
+
 def _login_headers():
+    ua = _random_ua()
     return {
         "Content-Type": "application/json",
-        "User-Agent": UA,
+        "User-Agent": ua,
         "Origin": "https://discord.com",
         "Referer": "https://discord.com/login",
         "X-Discord-Locale": "en-US",
         "X-Debug-Options": "bugReporterEnabled",
+        "X-Super-Properties": _super_properties(),
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
+def _proxy_dict():
+    if not PROXY_URL:
+        return None
+    return {"http": PROXY_URL, "https": PROXY_URL}
+
 def api_login(email, password, twofa="", max_retries=3):
-    # Discord غيّر الحقل من email إلى login
     payload = {
         "login": email,
         "password": password,
@@ -154,17 +237,22 @@ def api_login(email, password, twofa="", max_retries=3):
     }
 
     last_err = "فشل غير معروف"
+
     for attempt in range(1, max_retries + 1):
+        headers = _login_headers()
+        proxies = _proxy_dict()
+
         try:
             r = requests.post(
                 f"{API_BASE}/auth/login",
                 data=json.dumps(payload),
-                headers=_login_headers(),
+                headers=headers,
+                proxies=proxies,
                 timeout=30,
             )
         except Exception as e:
             last_err = f"اتصال: {e}"
-            log.warning(f"login attempt {attempt}: {last_err}")
+            log.warning(f"attempt {attempt}: {last_err}")
             time.sleep(3)
             continue
 
@@ -173,22 +261,27 @@ def api_login(email, password, twofa="", max_retries=3):
         except Exception:
             data = {}
 
-        log.info(f"login HTTP {r.status_code} body-keys={list(data.keys())}")
+        log.info(f"login HTTP {r.status_code} keys={list(data.keys())}")
 
         # نجاح
         if "token" in data:
             return data["token"], None
 
-        # MFA
+        # 2FA
         if data.get("mfa") or data.get("ticket"):
             if not twofa:
-                return None, "2FA مطلوب — حط DISCORD_2FA في env (رمز من تطبيق المصادقة)"
+                return None, "2FA مطلوب — حط DISCORD_2FA"
             try:
                 r2 = requests.post(
                     f"{API_BASE}/auth/mfa/totp",
-                    data=json.dumps({"code": twofa, "ticket": data["ticket"],
-                                     "login_source": None, "gift_code_sku_id": None}),
-                    headers=_login_headers(),
+                    data=json.dumps({
+                        "code": twofa,
+                        "ticket": data["ticket"],
+                        "login_source": None,
+                        "gift_code_sku_id": None,
+                    }),
+                    headers=headers,
+                    proxies=proxies,
                     timeout=30,
                 )
                 d2 = r2.json()
@@ -199,34 +292,59 @@ def api_login(email, password, twofa="", max_retries=3):
                 return None, f"2FA: {e}"
 
         # CAPTCHA
-        if "captcha_key" in data or "captcha_sitekey" in data or "captcha_service" in data:
-            svc = data.get("captcha_service", "hcaptcha")
-            last_err = (
-                f"CAPTCHA مطلوب من Discord ({svc}).\n"
-                "الحل: افتح Discord في متصفح على جهازك، سجّل دخول مرة وحدة،\n"
-                "ثم انسخ التوكن (F12 → Application → Local Storage → https://discord.com → token)\n"
-                "وحطه في متغير DISCORD_TOKEN بدل الإيميل/الباسوورد."
-            )
-            log.warning(f"CAPTCHA ({svc}) attempt {attempt}")
-            if attempt < max_retries:
-                time.sleep(10 * attempt)
-                continue
-            return None, last_err
+        if "captcha_sitekey" in data or data.get("captcha_service") == "hcaptcha":
+            sitekey = data.get("captcha_sitekey", "")
+            rqdata  = data.get("captcha_rqdata", "")
+            rqtoken = data.get("captcha_rqtoken", "")
+            log.warning(f"CAPTCHA required (sitekey={sitekey[:12]}...)")
 
-        # بيانات غلط فعلاً
+            if not CAPTCHA_KEY:
+                return None, (
+                    "CAPTCHA مطلوب من Discord.\n"
+                    "الحل: أضف CAPTCHA_API_KEY (مفتاح 2captcha.com) في env،\n"
+                    "أو استخدم PROXY_URL (بروكسي سكني) لتجنب CAPTCHA."
+                )
+
+            solved, err = solve_hcaptcha(sitekey, rqdata, rqtoken)
+            if err:
+                return None, f"فشل حل CAPTCHA: {err}"
+
+            # retry with solved key in headers
+            headers2 = dict(headers)
+            headers2["X-Captcha-Key"] = solved
+            if rqtoken:
+                headers2["X-Captcha-Rqtoken"] = rqtoken
+            if data.get("captcha_session_id"):
+                headers2["X-Captcha-Session-Id"] = data["captcha_session_id"]
+
+            try:
+                r3 = requests.post(
+                    f"{API_BASE}/auth/login",
+                    data=json.dumps(payload),
+                    headers=headers2,
+                    proxies=proxies,
+                    timeout=30,
+                )
+                d3 = r3.json()
+                if "token" in d3:
+                    return d3["token"], None
+                return None, f"CAPTCHA مرفوض: {d3.get('message', d3)}"
+            except Exception as e:
+                return None, f"retry captcha: {e}"
+
+        # بيانات غلط
         if r.status_code in (400, 401):
             msg = data.get("message", "") or str(data)
             if "invalid" in msg.lower() or "credentials" in msg.lower():
-                return None, "الإيميل أو كلمة المرور غير صحيحة (تأكد من الحقلين في Render)"
-            # 400 شكل آخر — نرجع التفاصيل
-            last_err = f"Discord رفض الطلب: HTTP {r.status_code} — {msg}"
+                return None, "الإيميل أو كلمة المرور غير صحيحة"
+            last_err = f"HTTP {r.status_code}: {msg}"
             if attempt < max_retries:
                 time.sleep(5 * attempt)
                 continue
             return None, last_err
 
         if r.status_code == 429:
-            last_err = "Rate limit من Discord — انتظر شوي"
+            last_err = "Rate limit — انتظر"
             time.sleep(20 * attempt)
             continue
 
@@ -240,7 +358,8 @@ def detect_token_type(token):
         try:
             r = requests.get(
                 f"{API_BASE}/users/@me",
-                headers={"Authorization": f"{prefix}{token}", "User-Agent": UA},
+                headers={"Authorization": f"{prefix}{token}", "User-Agent": _random_ua()},
+                proxies=_proxy_dict(),
                 timeout=10,
             )
             if r.status_code == 200:
@@ -274,14 +393,14 @@ def _discord_worker(token, token_type):
     async def on_ready():
         state["discord_ready"] = True
         log.info(f"✅ Discord: {bot.user} ({token_type})")
-        notify(f"✅ Discord جاهز\nالحساب: {bot.user}\nالنوع: {token_type}\nأرسل /private <guild_id>")
+        notify(f"✅ Discord جاهز\nالحساب: {bot.user}\nأرسل /private <guild_id>")
 
     try:
         loop.run_until_complete(bot.start(token))
     except Exception as e:
         state["last_error"] = f"discord: {e}"
         log.error(state["last_error"])
-        notify(f"❌ فشل اتصال Discord: {e}")
+        notify(f"❌ فشل Discord: {e}")
 
 def start_discord():
     if state["discord_bot"]:
@@ -480,7 +599,7 @@ HELP = (
     "/scan `<guild_id>` — كل الرومات\n"
     "/channels `<guild_id>` — تصنيف الرومات\n"
     "/status — الحالة\n"
-    "/retry_login — إعادة محاولة الدخول (لو كان فشل)\n\n"
+    "/retry_login — إعادة محاولة الدخول\n\n"
     "لو حطيت `GUILD_ID` في env، تقدر تحذف الآيدي."
 )
 
@@ -501,7 +620,7 @@ async def cmd_retry_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Discord متصل أصلاً")
         return
     if not DC_EMAIL or not DC_PASSWORD:
-        await update.message.reply_text("❌ DISCORD_EMAIL أو DISCORD_PASSWORD غير موجود في env")
+        await update.message.reply_text("❌ DISCORD_EMAIL أو DISCORD_PASSWORD غير موجود")
         return
     await update.message.reply_text("⏳ إعادة محاولة الدخول...")
     token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
@@ -631,7 +750,6 @@ async def post_init(app: Application):
             log.info("⏳ Discord auto-start (توكن)")
     elif DC_EMAIL and DC_PASSWORD:
         notify("🔐 جاري تسجيل الدخول إلى Discord...")
-        state["login_attempts"] += 1
         token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
         if token:
             state["discord_token"] = token
@@ -643,12 +761,12 @@ async def post_init(app: Application):
             log.error(f"auto login: {err}")
             notify(f"❌ فشل تسجيل دخول Discord:\n{err}")
     else:
-        notify("⚠️ ما فيه DISCORD_EMAIL أو DISCORD_PASSWORD في env")
+        notify("⚠️ ما فيه DISCORD_EMAIL أو DISCORD_PASSWORD")
 
 # =========================
 def main():
     if not TG_TOKEN:
-        log.error("❌ TELEGRAM_BOT_TOKEN غير موجود في env")
+        log.error("❌ TELEGRAM_BOT_TOKEN غير موجود")
         sys.exit(1)
 
     threading.Thread(target=run_flask, daemon=True).start()
