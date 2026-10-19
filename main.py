@@ -54,11 +54,10 @@ DC_TOKEN      = os.getenv("DISCORD_TOKEN", "").strip()
 DC_EMAIL      = os.getenv("DISCORD_EMAIL", "").strip()
 DC_PASSWORD   = os.getenv("DISCORD_PASSWORD", "").strip()
 DC_2FA        = os.getenv("DISCORD_2FA", "").strip()
-PROXY_URL     = os.getenv("PROXY_URL", "").strip()
 DEFAULT_GUILD = os.getenv("GUILD_ID", "").strip()
 RENDER_URL    = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
-NONECAP_KEY = os.getenv("NONECAP_API_KEY", "").strip() or "nc_live_OIWI2jryLCq_-yhorZBwpzft3NwXxjiQ"
+NOPECHA_KEY = os.getenv("NOPECHA_KEY", "").strip()
 
 state = {
     "discord_token": DC_TOKEN or None,
@@ -71,11 +70,10 @@ state = {
     "default_chat": int(TG_CHAT_ID) if TG_CHAT_ID.isdigit() else None,
     "scanning": False,
     "last_error": None,
-    "is_render": bool(RENDER_URL),
 }
 
 # ============================================================
-# hCaptcha Accessibility (مجاني — بدون مفتاح)
+# Accessibility Cookie (مجاني، بدون مفتاح)
 # ============================================================
 _HC_HEADERS = {
     "Host": "hcaptcha.com",
@@ -112,7 +110,6 @@ def _hc_n_data(req):
             "header": json.loads(base64.b64decode(req[0] + "=======").decode()),
             "payload": json.loads(base64.b64decode(req[1] + "=======").decode()),
         }
-
         def a(r):
             for t in range(len(r) - 1, -1, -1):
                 if r[t] < len(x) - 1:
@@ -120,19 +117,14 @@ def _hc_n_data(req):
                     return True
                 r[t] = 0
             return False
-
         def i(r):
             return "".join(x[n] for n in r)
-
         def o(r, e):
             hashed = hashlib.sha1(e.encode())
             t = hashed.digest()
-            o_bits = []
-            for n in range(0, 8 * len(t)):
-                o_bits.append((t[n // 8] >> (n % 8)) & 1)
+            o_bits = [(t[n // 8] >> (n % 8)) & 1 for n in range(0, 8 * len(t))]
             a_bits = o_bits[:r]
             return 0 == a_bits[0] and a_bits[1:].index(1) >= r - 2 if 1 in a_bits else False
-
         def get():
             for e in range(25):
                 n = [0 for _ in range(e)]
@@ -140,7 +132,6 @@ def _hc_n_data(req):
                     u = req["payload"]["d"] + "::" + i(n)
                     if o(req["payload"]["s"], u):
                         return i(n)
-
         result = get()
         if not result:
             return False
@@ -199,88 +190,32 @@ def solve_accessibility(sitekey, host="discord.com"):
         return None, f"accessibility: {e}"
 
 # ============================================================
-# NoneCap
+# NopeCHA (اختياري)
 # ============================================================
-def solve_nonecap(sitekey, rqdata="", rqtoken="", url="https://discord.com/login", wait=30):
-    if not NONECAP_KEY:
-        return None, "NONECAP_API_KEY غير موجود"
-    body = {"type": "hcaptcha", "sitekey": sitekey, "url": url}
-    if rqdata:
-        body["rqdata"] = rqdata
-    if rqtoken:
-        body["rqtoken"] = rqtoken
+def solve_nopecha(sitekey, rqdata="", url="https://discord.com/login"):
+    if not NOPECHA_KEY:
+        return None, "NOPECHA_KEY غير موجود"
     try:
         r = requests.post(
-            f"https://api.nonecap.com/v1/solves?wait={wait}",
-            headers={"Authorization": f"Bearer {NONECAP_KEY}", "Content-Type": "application/json"},
-            json=body, timeout=wait + 30,
+            "https://api.nopecha.com/token",
+            json={
+                "type": "hcaptcha",
+                "sitekey": sitekey,
+                "url": url,
+                "data": rqdata or None,
+            },
+            headers={"Authorization": f"Bearer {NOPECHA_KEY}"},
+            timeout=120,
         )
-    except Exception as e:
-        return None, f"NoneCap اتصال: {e}"
-    try:
         data = r.json()
-    except Exception:
-        return None, f"NoneCap HTTP {r.status_code}"
-    if r.status_code == 200:
-        token = data.get("token")
-        if token:
-            return token, None
-        if data.get("status") == "pending":
-            return _poll_nonecap(data.get("id"), wait)
-        return None, "NoneCap بدون token"
-    if r.status_code == 402:
-        return None, "NoneCap رصيد غير كافٍ"
-    if r.status_code == 429:
-        return None, "NoneCap rate limit"
-    if r.status_code == 401:
-        return None, "NoneCap مفتاح غير صالح"
-    return None, f"NoneCap HTTP {r.status_code}"
-
-def _poll_nonecap(solve_id, wait=30):
-    if not solve_id:
-        return None, "NoneCap لا يوجد id"
-    for _ in range(10):
-        time.sleep(5)
-        try:
-            r = requests.get(
-                f"https://api.nonecap.com/v1/solves/{solve_id}?wait={wait}",
-                headers={"Authorization": f"Bearer {NONECAP_KEY}"}, timeout=wait + 30,
-            )
-            d = r.json()
-            if d.get("token"):
-                return d["token"], None
-            if d.get("status") in ("failed", "error"):
-                return None, "NoneCap فشل"
-        except Exception:
-            continue
-    return None, "NoneCap timeout"
+        if data.get("data"):
+            return data["data"], None
+        return None, f"NopeCHA: {data.get('message', data)}"
+    except Exception as e:
+        return None, f"NopeCHA: {e}"
 
 # ============================================================
-# CaptchaHandler
-# ============================================================
-class MultiCaptchaHandler(discord.CaptchaHandler):
-    def solvecaptcha(self, data, proxy=None, proxy_auth=None):
-        sitekey = data.get("captcha_sitekey", "")
-        rqdata = data.get("captcha_rqdata", "")
-        rqtoken = data.get("captcha_rqtoken", "")
-        log.info(f"CaptchaHandler: sitekey={sitekey[:12]}")
-        # 1) accessibility (مجاني، قد ينجح محلياً)
-        token, err = solve_accessibility(sitekey, "discord.com")
-        if token:
-            return token
-        log.warning(f"accessibility فشل: {err}")
-        # 2) NoneCap
-        token, err = solve_nonecap(sitekey, rqdata, rqtoken)
-        if token:
-            return token
-        raise RuntimeError(f"فشل كل الحلول: {err}")
-
-    async def fetch_token(self, data, proxy=None, proxy_auth=None):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.solvecaptcha, data, proxy, proxy_auth)
-
-# ============================================================
-# Flask
+# Flask keep-alive
 # ============================================================
 flask_app = Flask(__name__)
 
@@ -361,7 +296,7 @@ def notify(text):
         send_tg(chat, text)
 
 # ============================================================
-# Discord login
+# Discord login (بدون CaptchaHandler)
 # ============================================================
 def _random_ua():
     chrome = random.choice(["131.0.0.0", "132.0.0.0", "133.0.0.0"])
@@ -399,12 +334,7 @@ def _login_headers():
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-def _proxy_dict():
-    if not PROXY_URL:
-        return None
-    return {"http": PROXY_URL, "https": PROXY_URL}
-
-def api_login(email, password, twofa="", max_retries=2):
+def api_login(email, password, twofa="", max_retries=3):
     payload = {
         "login": email, "password": password, "undelete": False,
         "captcha_key": None, "login_source": None, "gift_code_sku_id": None,
@@ -412,13 +342,8 @@ def api_login(email, password, twofa="", max_retries=2):
     last_err = "فشل غير معروف"
     for attempt in range(1, max_retries + 1):
         headers = _login_headers()
-        proxies = _proxy_dict()
         try:
-            r = requests.post(
-                f"{API_BASE}/auth/login",
-                data=json.dumps(payload), headers=headers,
-                proxies=proxies, timeout=30,
-            )
+            r = requests.post(f"{API_BASE}/auth/login", data=json.dumps(payload), headers=headers, timeout=30)
         except Exception as e:
             last_err = f"اتصال: {e}"
             time.sleep(3)
@@ -438,7 +363,7 @@ def api_login(email, password, twofa="", max_retries=2):
                     f"{API_BASE}/auth/mfa/totp",
                     data=json.dumps({"code": twofa, "ticket": data["ticket"],
                                      "login_source": None, "gift_code_sku_id": None}),
-                    headers=headers, proxies=proxies, timeout=30,
+                    headers=headers, timeout=30,
                 )
                 d2 = r2.json()
                 if "token" in d2:
@@ -451,17 +376,18 @@ def api_login(email, password, twofa="", max_retries=2):
             rqdata = data.get("captcha_rqdata", "")
             rqtoken = data.get("captcha_rqtoken", "")
             log.warning(f"CAPTCHA — محاولة الحلول")
-            # 1) accessibility
+            # 1) Accessibility
             solved, err1 = solve_accessibility(sitekey, "discord.com")
             if not solved:
-                log.warning(f"accessibility فشل: {err1} — NoneCap")
-                solved, err2 = solve_nonecap(sitekey, rqdata, rqtoken)
+                log.warning(f"accessibility فشل: {err1} — NopeCHA")
+                # 2) NopeCHA
+                solved, err2 = solve_nopecha(sitekey, rqdata)
                 if not solved:
                     return None, (
                         f"فشل حل CAPTCHA.\n"
-                        f"السبب: {err2}\n\n"
-                        "⚠️ ملاحظة: Discord يرفض توكنات hCaptcha من IPs مراكز البيانات (Render).\n"
-                        "الحل: شغّل الأداة على جهازك (IP منزلي) أو استخدم بروكسي سكني عبر PROXY_URL."
+                        f"accessibility: {err1}\n"
+                        f"NopeCHA: {err2}\n\n"
+                        "⚠️ جرّب إعادة المحاولة أو استخدم IP سكني."
                     )
             headers2 = dict(headers)
             headers2["X-Captcha-Key"] = solved
@@ -470,11 +396,7 @@ def api_login(email, password, twofa="", max_retries=2):
             if data.get("captcha_session_id"):
                 headers2["X-Captcha-Session-Id"] = data["captcha_session_id"]
             try:
-                r3 = requests.post(
-                    f"{API_BASE}/auth/login",
-                    data=json.dumps(payload), headers=headers2,
-                    proxies=proxies, timeout=30,
-                )
+                r3 = requests.post(f"{API_BASE}/auth/login", data=json.dumps(payload), headers=headers2, timeout=30)
                 d3 = r3.json()
                 if "token" in d3:
                     return d3["token"], None
@@ -504,7 +426,7 @@ def detect_token_type(token):
             r = requests.get(
                 f"{API_BASE}/users/@me",
                 headers={"Authorization": f"{prefix}{token}", "User-Agent": _random_ua()},
-                proxies=_proxy_dict(), timeout=10,
+                timeout=10,
             )
             if r.status_code == 200:
                 return kind
@@ -513,7 +435,7 @@ def detect_token_type(token):
     return None
 
 # ============================================================
-# Discord worker
+# Discord worker — بدون CaptchaHandler
 # ============================================================
 def _discord_worker(token, token_type):
     loop = asyncio.new_event_loop()
@@ -525,12 +447,12 @@ def _discord_worker(token, token_type):
     intents.guilds = True
     intents.members = True
 
+    # بدون captcha_handler — تمت إزالته من الإصدارات الحديثة
     bot = commands.Bot(
         command_prefix="!x",
         self_bot=(token_type == "user"),
         intents=intents,
         help_command=None,
-        captcha_handler=MultiCaptchaHandler() if token_type == "user" else None,
     )
     state["discord_bot"] = bot
 
@@ -562,7 +484,7 @@ def start_discord():
     return True
 
 # ============================================================
-# Format
+# Format & Hunter (كما هي)
 # ============================================================
 def fmt_author(m):
     try:
@@ -591,9 +513,6 @@ def fmt_message(m):
         pass
     return "\n".join(out)
 
-# ============================================================
-# Hunter
-# ============================================================
 class Hunter:
     def __init__(self):
         self.captured = {}
@@ -646,9 +565,6 @@ def is_private_channel(ch, guild):
     except Exception:
         return False
 
-# ============================================================
-# Scan
-# ============================================================
 async def do_scan(guild_id, chat_id, only_private=False):
     state["scanning"] = True
     try:
@@ -781,9 +697,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"النوع: {state['token_type'] or '—'}",
             f"الحساب: {bot.user if ready else '—'}",
             f"فحص جاري: {'نعم' if state['scanning'] else 'لا'}",
-            f"NoneCap: {'✅' if NONECAP_KEY else '❌'}",
-            f"بروكسي: {'✅' if PROXY_URL else '❌'}",
-            f"بيئة: {'Render (IP مركز بيانات)' if state['is_render'] else 'محلي (IP منزلي)'}",
+            f"NopeCHA: {'✅' if NOPECHA_KEY else '❌'}",
         ]
         if state["last_error"]:
             lines.append(f"آخر خطأ: {state['last_error']}")
@@ -856,7 +770,6 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if err:
             await update.message.reply_text(err)
             return
-
         async def _list():
             try:
                 bot = state["discord_bot"]
@@ -878,7 +791,6 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 send_tg(update.effective_chat.id, "\n".join(lines))
             except Exception as e:
                 log.error(f"list: {e}")
-
         asyncio.run_coroutine_threadsafe(_list(), state["discord_loop"])
         await update.message.reply_text("📋 جاري الجلب...")
     except Exception as e:
