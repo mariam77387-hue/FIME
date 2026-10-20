@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import types
 import io
@@ -71,8 +72,67 @@ state = {
     "scanning": False,
     "last_error": None,
     "login_attempts": 0,
-    "login_result": None,
 }
+
+# ============================================================
+# التحقق من متغيرات البيئة (قبل أي شيء)
+# ============================================================
+def _mask(val, head=6, tail=4):
+    """يقنّع القيمة مع إبقاء بعض المعالم للتشخيص."""
+    if not val:
+        return "(فارغ)"
+    if len(val) <= head + tail + 3:
+        return val[:2] + "***" + val[-1:]
+    return val[:head] + "..." + val[-tail:]
+
+def _has_suspicious(val):
+    """يكشف الرموز الغريبة اللي غالباً تكون من لصق خاطئ."""
+    bad_chars = {
+        ">": "علامة أكبر من (غالباً من redirect أو لصق خاطئ)",
+        "<": "علامة أصغر من",
+        '"': "علامة اقتباس مزدوجة",
+        "'": "علامة اقتباس أحادية",
+        " ": "مسافة",
+        "\n": "سطر جديد",
+        "\t": "تاب",
+    }
+    issues = []
+    for c, desc in bad_chars.items():
+        if c in val:
+            issues.append(desc)
+    return issues
+
+def _show_env_status():
+    """يطبع حالة كل المتغيرات (مقنّعة) قبل البدء."""
+    log.info("=" * 60)
+    log.info("📋 فحص المتغيرات:")
+    log.info(f"  TELEGRAM_BOT_TOKEN: {_mask(TG_TOKEN, 12, 6)}")
+    log.info(f"  TELEGRAM_CHAT_ID:   {TG_CHAT_ID or '(فارغ)'}")
+    log.info(f"  DISCORD_TOKEN:      {_mask(DC_TOKEN, 6, 4) if DC_TOKEN else '(فارغ)'}")
+    log.info(f"  DISCORD_EMAIL:      {_mask(DC_EMAIL, 3, 8) if DC_EMAIL else '(فارغ)'}")
+    log.info(f"  DISCORD_PASSWORD:   {'(موجود)' if DC_PASSWORD else '(فارغ)'}")
+    log.info(f"  DISCORD_2FA:        {'(موجود)' if DC_2FA else '(فارغ)'}")
+    log.info(f"  GUILD_ID:           {DEFAULT_GUILD or '(فارغ)'}")
+    log.info(f"  NOPECHA_KEY:        {'(موجود)' if NOPECHA_KEY else '(فارغ)'}")
+    log.info(f"  PORT:               {PORT}")
+    log.info("=" * 60)
+
+def _validate_tg_token(token):
+    """يتحقق من صيغة توكن تيليجرام."""
+    if not token:
+        return False, "TELEGRAM_BOT_TOKEN فارغ تماماً"
+    issues = _has_suspicious(token)
+    if issues:
+        return False, f"فيه رموز غريبة: {'، '.join(issues)}"
+    if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
+        parts = token.split(":", 1)
+        if len(parts) != 2:
+            return False, "صيغة غير صحيحة — ما فيه ':' بين الرقم والسر"
+        if not parts[0].isdigit():
+            return False, "الجزء قبل ':' لازم يكون أرقام (معرف البوت)"
+        if len(parts[1]) < 30:
+            return False, f"الجزء بعد ':' قصير جداً ({len(parts[1])} حرف، المتوقع 35+) — التوكن مقطوع"
+    return True, None
 
 # ============================================================
 # Accessibility Cookie (مجاني)
@@ -97,7 +157,7 @@ _HC_COOKIES = {
         "uQOMlyTSI1GIVz9AazrmLIgl7NAufVofFaQDhnTL9CNyhqVwlaibJmi6mQrr377HrCaTI7VCWxo1kniM"
         "jJDOEz4X29+NH5awd4jH6hPyKIOZhNjWuMrNSKu6ZFLuRSgOiy4c+0idoOSRYiOiX9HK8KkQaHk8EfkR"
         "05vRrjPBkaNVKqg1RcpcfREQ06gIS9YzkItTt+2z/aHHZU1rAdJTyJ8oijsq2Mis23zqp9EWQ52H4oWE"
-        "stionkOct9Z8NgybESmrdNsowi3NXNOoVwWoU4ZEwGCbjG8eO2HnSP1vPKUi6tT7Z39E2eCMAJJDn9d"
+        "stionkOct9Z8NgybESmrdNsowi3NXNOoVwWoU4ZEwGCbjG8eO+2HnSP1vPKUi6tT7Z39E2eCMAJJDn9d"
         "yenkOuFRcOMmFiMIIIFsTUniyM7EhvSWxWDFvI+4zbx/+TP5pQClZJcLbXinpw1SMk3GVT3S6EG2n/Dy"
         "LQ0/p3+/CJYbr7sVjdeRLABGyCMvaOPy+dvaRH+mszz58EoV35sq9835SPRD17jNym9E=UCa12gEu9VI"
         "PScd9"
@@ -137,12 +197,11 @@ def _hc_n_data(req):
         result = get()
         if not result:
             return False
-        hsl = ":".join([
+        return ":".join([
             "1", str(req["payload"]["s"]),
             time.strftime("%Y%m%d%H%M%S"),
             req["payload"]["d"], "", result,
         ])
-        return hsl
     except Exception:
         return False
 
@@ -191,9 +250,6 @@ def solve_accessibility(sitekey, host="discord.com"):
     except Exception as e:
         return None, f"accessibility: {e}"
 
-# ============================================================
-# NopeCHA
-# ============================================================
 def solve_nopecha(sitekey, rqdata="", url="https://discord.com/login"):
     if not NOPECHA_KEY:
         return None, "NOPECHA_KEY غير موجود"
@@ -273,7 +329,7 @@ def api_login(email, password, twofa="", max_retries=3):
             return data["token"], None
         if data.get("mfa") or data.get("ticket"):
             if not twofa:
-                return None, "2FA مطلوب — أضف رمز 2FA في النموذج"
+                return None, "2FA مطلوب — أضف DISCORD_2FA"
             try:
                 r2 = requests.post(
                     f"{API_BASE}/auth/mfa/totp",
@@ -301,7 +357,7 @@ def api_login(email, password, twofa="", max_retries=3):
                         f"فشل حل CAPTCHA.\n"
                         f"accessibility: {err1}\n"
                         f"NopeCHA: {err2}\n\n"
-                        "⚠️ جرّب إعادة المحاولة أو استخدم IP سكني."
+                        "⚠️ الأفضل استخدام IP سكني (جهازك/جوالك) أو بروكسي سكني."
                     )
             headers2 = dict(headers)
             headers2["X-Captcha-Key"] = solved
@@ -399,77 +455,40 @@ def start_discord(token=None):
     return True
 
 # ============================================================
-# Flask — صفحة تسجيل الدخول
+# Flask
 # ============================================================
 flask_app = Flask(__name__)
 
-LOGIN_HTML = """
-<!doctype html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>تسجيل دخول Discord</title>
-<style>
-*{box-sizing:border-box}
-body{background:#0f1115;color:#e5e7eb;font-family:system-ui,sans-serif;margin:0;padding:24px;min-height:100vh;display:flex;align-items:center;justify-content:center}
+LOGIN_HTML = """<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>دخول Discord</title>
+<style>*{box-sizing:border-box}body{background:#0f1115;color:#e5e7eb;font-family:system-ui;margin:0;padding:24px;min-height:100vh;display:flex;align-items:center;justify-content:center}
 .box{background:#161a23;padding:28px;border-radius:14px;width:100%;max-width:400px;box-shadow:0 10px 40px rgba(0,0,0,.6)}
-h1{font-size:20px;margin:0 0 8px;color:#7c9eff}
-p.sub{font-size:13px;color:#9ca3af;margin:0 0 20px}
+h1{font-size:20px;margin:0 0 8px;color:#7c9eff}p.sub{font-size:13px;color:#9ca3af;margin:0 0 20px}
 label{font-size:13px;color:#9ca3af;display:block;margin:14px 0 6px}
 input{width:100%;padding:11px;border-radius:8px;border:1px solid #2b3242;background:#0b0e14;color:#e5e7eb;font-size:14px}
 button{width:100%;padding:12px;border:0;border-radius:8px;background:#5865f2;color:#fff;font-weight:600;font-size:15px;margin-top:20px;cursor:pointer}
-button:hover{background:#4752c4}
-.status{margin-top:16px;padding:12px;border-radius:8px;font-size:13px;line-height:1.5}
-.ok{background:#14361f;color:#4ade80;border:1px solid #166534}
-.err{background:#3b1219;color:#f87171;border:1px solid #7f1d1d}
-.info{background:#1e2740;color:#93c5fd;border:1px solid #1e3a8a}
-code{background:#0b0e14;padding:2px 6px;border-radius:4px;font-size:12px}
-</style>
-</head>
-<body>
-<div class="box">
-<h1>🔐 تسجيل دخول Discord</h1>
-<p class="sub">الإيميل والباسوورد يرسلان مباشرة من متصفحك إلى البوت. لا يخزنان.</p>
+button:hover{background:#4752c4}.status{margin-top:16px;padding:12px;border-radius:8px;font-size:13px;line-height:1.5}
+.ok{background:#14361f;color:#4ade80;border:1px solid #166534}.err{background:#3b1219;color:#f87171;border:1px solid #7f1d1d}</style>
+</head><body><div class="box"><h1>🔐 تسجيل دخول Discord</h1>
+<p class="sub">⚠️ هذه الصفحة تعمل فقط إذا كنت تشغل البوت محلياً أو عبر tunnel. على لوحات الاستضافة (Pterodactyl) لا تقدر توصلها — استخدم متغيرات البيئة.</p>
 <form method="post" action="/login">
-<label>الإيميل / الهاتف</label>
-<input name="email" required autocomplete="username">
-<label>كلمة المرور</label>
-<input name="password" type="password" required autocomplete="current-password">
-<label>رمز 2FA (اختياري)</label>
-<input name="twofa" autocomplete="one-time-code" inputmode="numeric">
-<button type="submit">دخول</button>
-</form>
-{{status}}
-</div>
-</body>
-</html>
-"""
+<label>الإيميل / الهاتف</label><input name="email" required>
+<label>كلمة المرور</label><input name="password" type="password" required>
+<label>رمز 2FA (اختياري)</label><input name="twofa" inputmode="numeric">
+<button type="submit">دخول</button></form>{{status}}</div></body></html>"""
 
-STATUS_HTML = """
-<!doctype html>
-<html lang="ar" dir="rtl">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>الحالة</title>
-<style>
-body{background:#0f1115;color:#e5e7eb;font-family:system-ui,sans-serif;padding:24px;max-width:500px;margin:auto}
-.box{background:#161a23;padding:24px;border-radius:14px}
-h1{color:#7c9eff;font-size:20px;margin:0 0 16px}
+STATUS_HTML = """<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>الحالة</title>
+<style>body{background:#0f1115;color:#e5e7eb;font-family:system-ui;padding:24px;max-width:500px;margin:auto}
+.box{background:#161a23;padding:24px;border-radius:14px}h1{color:#7c9eff;font-size:20px;margin:0 0 16px}
 .row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #2b3242;font-size:14px}
-.row:last-child{border:0}
-a{color:#7c9eff;text-decoration:none;display:inline-block;margin-top:16px}
-</style></head><body>
-<div class="box">
-<h1>📊 حالة البوت</h1>
+.row:last-child{border:0}a{color:#7c9eff;text-decoration:none;display:inline-block;margin-top:16px}</style></head><body>
+<div class="box"><h1>📊 حالة البوت</h1>
 <div class="row"><span>Discord</span><span>{{ready}}</span></div>
 <div class="row"><span>النوع</span><span>{{kind}}</span></div>
 <div class="row"><span>الحساب</span><span>{{user}}</span></div>
 <div class="row"><span>آخر خطأ</span><span>{{error}}</span></div>
-<div class="row"><span>محادثة تيليجرام</span><span>{{chat}}</span></div>
-<a href="/">← رجوع</a>
-</div>
-</body></html>
-"""
+<div class="row"><span>Telegram</span><span>{{tg}}</span></div>
+<a href="/">← رجوع</a></div></body></html>"""
 
 def _render_login(status=""):
     return render_template_string(LOGIN_HTML, status=status)
@@ -488,7 +507,7 @@ def status_page():
         kind=state["token_type"] or "—",
         user=(state["discord_bot"].user if state["discord_bot"] and state["discord_ready"] else "—"),
         error=state["last_error"] or "—",
-        chat=state["default_chat"] or "—",
+        tg="✅ متصل" if state["tg_app"] else "❌ فشل",
     )
 
 @flask_app.route("/login", methods=["POST"])
@@ -508,10 +527,7 @@ def login_post():
         return _render_login(f'<div class="status err">❌ {err}</div>')
     state["last_error"] = None
     if start_discord(token=token):
-        return _render_login(
-            '<div class="status ok">✅ تم الدخول! جاري الاتصال بـ Discord...<br>'
-            '<a href="/status" style="color:#4ade80">اذهب للحالة</a></div>'
-        )
+        return _render_login('<div class="status ok">✅ تم الدخول! جاري الاتصال...<br><a href="/status" style="color:#4ade80">اذهب للحالة</a></div>')
     return _render_login('<div class="status err">❌ التوكن غير صالح</div>')
 
 @flask_app.route("/ping")
@@ -519,7 +535,10 @@ def ping():
     return "alive", 200
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+    try:
+        flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+    except Exception as e:
+        log.error(f"Flask: {e}")
 
 def self_ping_loop():
     if not RENDER_URL:
@@ -532,7 +551,7 @@ def self_ping_loop():
         time.sleep(14 * 60)
 
 # ============================================================
-# Telegram
+# Telegram helpers
 # ============================================================
 def _clean(text):
     try:
@@ -749,7 +768,7 @@ HELP = (
     "/channels <guild_id> — تصنيف الرومات\n"
     "/status — الحالة\n"
     "/retry_login — إعادة محاولة الدخول\n\n"
-    "لتسجيل الدخول، افتح صفحة الويب في المتصفح: /"
+    "ملاحظة: على لوحات الاستضافة، Discord يجب أن يكون في env (DISCORD_EMAIL+DISCORD_PASSWORD أو DISCORD_TOKEN)."
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -757,8 +776,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["default_chat"] = update.effective_chat.id
         ready = state["discord_ready"]
         lines = [f"👋 أهلاً", f"Discord: {'✅ جاهز' if ready else '❌ غير متصل'}"]
-        if not ready:
-            lines.append("🔐 لتسجيل الدخول: افتح صفحة الويب (الرابط في /status)")
         if state["last_error"]:
             lines.append(f"⚠️ آخر خطأ: {state['last_error']}")
         lines.append("")
@@ -778,11 +795,23 @@ async def cmd_retry_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state["discord_ready"]:
             await update.message.reply_text("✅ Discord متصل أصلاً")
             return
-        await update.message.reply_text(
-            "🔐 لتسجيل الدخول: افتح صفحة الويب من متصفح هاتفك.\n"
-            "استخدم /status للحصول على رابط الخدمة.\n\n"
-            "أو إذا حطيت DISCORD_EMAIL و DISCORD_PASSWORD في المتغيرات وأعدت التشغيل، سيتصل تلقائياً."
-        )
+        if not DC_EMAIL or not DC_PASSWORD:
+            await update.message.reply_text(
+                "❌ DISCORD_EMAIL أو DISCORD_PASSWORD غير موجود في متغيرات البيئة.\n"
+                "على لوحات الاستضافة، أضفهما من لوحة التحكم ثم أعد التشغيل."
+            )
+            return
+        await update.message.reply_text("⏳ إعادة محاولة الدخول...")
+        token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
+        if err:
+            state["last_error"] = err
+            await update.message.reply_text(f"❌ {err}"[:4000])
+            return
+        state["discord_token"] = token
+        if start_discord():
+            await update.message.reply_text("✅ نجح، جاري الاتصال...")
+        else:
+            await update.message.reply_text("❌ التوكن غير صالح")
     except Exception as e:
         log.error(f"cmd_retry_login: {e}")
 
@@ -796,13 +825,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"الحساب: {bot.user if ready else '—'}",
             f"فحص جاري: {'نعم' if state['scanning'] else 'لا'}",
             f"NopeCHA: {'✅' if NOPECHA_KEY else '❌'}",
+            f"DC_EMAIL: {'✅' if DC_EMAIL else '❌'}",
+            f"DC_PASSWORD: {'✅' if DC_PASSWORD else '❌'}",
         ]
         if state["last_error"]:
             lines.append(f"آخر خطأ: {state['last_error']}")
-        if RENDER_URL:
-            lines.append(f"🌐 صفحة الدخول: {RENDER_URL}/")
-        else:
-            lines.append(f"🌐 صفحة الدخول (محلي): http://127.0.0.1:{PORT}/")
         await update.message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
     except Exception as e:
         log.error(f"cmd_status: {e}")
@@ -827,7 +854,7 @@ async def cmd_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⏳ فيه فحص جاري")
             return
         if not state["discord_ready"]:
-            await update.message.reply_text("❌ Discord ما اتصل بعد. سجّل دخول من صفحة الويب أولاً. /status")
+            await update.message.reply_text("❌ Discord ما اتصل بعد. /status")
             return
         gid, err = await _resolve_guild(context)
         if err:
@@ -918,12 +945,11 @@ async def post_init(app: Application):
         state["tg_app"] = app
         log.info("✅ Telegram جاهز")
 
-        # محاولة الدخول التلقائي إذا المتغيرات موجودة
         if state["discord_token"]:
             if start_discord():
-                log.info("⏳ Discord auto-start (توكن)")
+                log.info("⏳ Discord auto-start (DISCORD_TOKEN)")
         elif DC_EMAIL and DC_PASSWORD:
-            notify("🔐 جاري تسجيل الدخول التلقائي...")
+            log.info("🔐 محاولة دخول Discord تلقائياً...")
             token, err = await asyncio.to_thread(api_login, DC_EMAIL, DC_PASSWORD, DC_2FA)
             if token:
                 state["discord_token"] = token
@@ -933,19 +959,43 @@ async def post_init(app: Application):
             else:
                 state["last_error"] = err
                 log.error(f"auto login: {err}")
-                notify(f"❌ فشل الدخول التلقائي: {err}\nسجّل يدوياً من صفحة الويب: {RENDER_URL or f'http://127.0.0.1:{PORT}'}/")
+                notify(f"❌ فشل تسجيل دخول Discord:\n{err}\n\nاستخدم /retry_login للمحاولة مرة أخرى.")
         else:
-            link = f"{RENDER_URL}/" if RENDER_URL else f"http://127.0.0.1:{PORT}/"
-            log.warning(f"⚠️ لا متغيرات دخول. افتح {link} لتسجيل الدخول")
-            notify(f"🔐 لتسجيل دخول Discord، افتح:\n{link}")
+            log.warning("⚠️ لا DISCORD_TOKEN ولا DISCORD_EMAIL/PASSWORD — أضفهما في env")
+            notify(
+                "⚠️ لا يوجد Discord credentials في المتغيرات.\n"
+                "أضف أحد التالي في لوحة الاستضافة ثم أعد التشغيل:\n"
+                "• DISCORD_TOKEN (توكن حساب)\n"
+                "• أو DISCORD_EMAIL + DISCORD_PASSWORD"
+            )
     except Exception as e:
         log.error(f"post_init: {e}")
 
 # ============================================================
 def main():
-    if not TG_TOKEN:
-        log.error("❌ TELEGRAM_BOT_TOKEN غير موجود")
+    _show_env_status()
+
+    ok, err = _validate_tg_token(TG_TOKEN)
+    if not ok:
+        log.error("=" * 60)
+        log.error("❌ TELEGRAM_BOT_TOKEN غير صالح!")
+        log.error(f"   السبب: {err}")
+        log.error(f"   القيمة (مقنّعة): {_mask(TG_TOKEN, 12, 6)}")
+        log.error(f"   الطول: {len(TG_TOKEN)} حرف")
+        log.error("")
+        log.error("   🔧 الحل:")
+        log.error("   1. افتح لوحة الاستضافة → Environment Variables")
+        log.error("   2. ابحث عن TELEGRAM_BOT_TOKEN")
+        log.error("   3. امسح القيمة الحالية")
+        log.error("   4. افتح @BotFather → /mybots → اختر بوتك → API Token")
+        log.error("   5. انسخ التوكن كاملاً والصقه (بدون > < \" ' ولا مسافات)")
+        log.error("   6. أعد التشغيل")
+        log.error("")
+        log.error("   ⚠️ الصيغة الصحيحة: 1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        log.error("=" * 60)
         sys.exit(1)
+
+    log.info(f"✅ TELEGRAM_BOT_TOKEN صالح (طول={len(TG_TOKEN)})")
 
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
@@ -960,7 +1010,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_error_handler(on_error)
 
-    log.info(f"🤖 Telegram polling... صفحة الويب على المنفذ {PORT}")
+    log.info(f"🤖 Telegram polling بدأ — Flask على منفذ {PORT}")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
