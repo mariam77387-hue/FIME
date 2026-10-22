@@ -2,93 +2,80 @@ import os
 import asyncio
 import logging
 import secrets
+import threading
 from typing import Dict, Optional, List
 
-from flask import Flask, request, redirect
-import threading
-
+from flask import Flask, request
+import discordoauth2
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
-
-import discordoauth2
 
 # ================== الإعدادات ==================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI")
-WEB_PORT = int(os.environ.get("WEB_PORT", 8080))
+
+# ✅ قراءة المنفذ من متغير البيئة PORT (الذي توفره الاستضافة)
+# إذا لم يوجد، يتم استخدام 26683 كقيمة افتراضية
+WEB_PORT = int(os.environ.get("PORT", os.environ.get("WEB_PORT", 26683)))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # ================== OAuth2 Client ==================
-# المكتبة treeben77/discord-oauth2.py
 oauth_client = discordoauth2.Client(
     client_id=DISCORD_CLIENT_ID,
     client_secret=DISCORD_CLIENT_SECRET,
     redirect_uri=DISCORD_REDIRECT_URI,
 )
 
-# تخزين مؤقت لربط رمز التفويض بمعرف محادثة تيليجرام
-# المفتاح: state (عشوائي)، القيمة: chat_id
 pending_auth: Dict[str, int] = {}
+auth_codes: Dict[int, str] = {}
 
-# ================== خادم Flask لاستقبال OAuth2 ==================
+# ================== خادم Flask ==================
 flask_app = Flask(__name__)
 
 @flask_app.route("/callback")
 def callback():
-    """يستقبل رمز التفويض من Discord بعد موافقة المستخدم."""
     code = request.args.get("code")
     state = request.args.get("state")
     error = request.args.get("error")
 
     if error:
-        return "تم إلغاء التفويض. يمكنك العودة إلى تيليجرام.", 400
+        logger.warning(f"OAuth2 error: {error}")
+        return "تم إلغاء التفويض. يمكنك العودة إلى تيليجرام والمحاولة مرة أخرى.", 400
     if not code or not state:
-        return "طلب غير صالح.", 400
+        return "طلب غير صالح: رمز التفويض أو الحالة مفقود.", 400
 
     chat_id = pending_auth.pop(state, None)
     if not chat_id:
-        return "انتهت صلاحية الجلسة. يرجى البدء من جديد من تيليجرام.", 400
+        return "انتهت صلاحية الجلسة. يرجى البدء من جديد من تيليجرام باستخدام /auth.", 400
 
-    # حفظ الكود مؤقتًا لكي يستخدمه البوت (سنستخدم قاموسًا عامًا)
     auth_codes[chat_id] = code
-    return "تم التفويض بنجاح! ✅ يمكنك العودة إلى تيليجرام وإرسال أي رسالة للمتابعة.", 200
+    logger.info(f"تم استلام كود التفويض للمحادثة {chat_id}")
+    return "✅ تم التفويض بنجاح! يمكنك العودة إلى تيليجرام وإرسال أي رسالة ليتم عرض سيرفراتك.", 200
 
-# قاموس عام لتخزين الأكواد مؤقتًا
-auth_codes: Dict[int, str] = {}
+@flask_app.route("/health")
+def health():
+    """نقطة نهاية بسيطة للتحقق من أن الخادم يعمل (مفيدة لبعض الاستضافات)."""
+    return "OK", 200
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=WEB_PORT)
+    """تشغيل خادم Flask على المنفذ المحدد."""
+    logger.info(f"خادم Flask يستمع على المنفذ {WEB_PORT}")
+    flask_app.run(host="0.0.0.0", port=WEB_PORT, use_reloader=False)
 
-# ================== دوال مساعدة ==================
-async def fetch_guilds_async(access_token: str) -> List[dict]:
-    """جلب السيرفرات باستخدام access_token عبر Discord API الرسمي."""
-    # نستخدم مكتبة discordoauth2 لجلب السيرفرات
-    # ملاحظة: المكتبة قد تكون متزامنة، لذلك نغلفها في executor
-    loop = asyncio.get_running_loop()
-    def _fetch():
-        # access = oauth_client.fetch_access_token(code)  # لا نحتاج هذا هنا، لأن access_token جاهز
-        # لكن discordoauth2 يوفر كائن AccessToken
-        # الأسهل: نستخدم requests مباشرة إذا كانت المكتبة معقدة
-        import requests
-        headers = {"Authorization": f"Bearer {access_token}"}
-        r = requests.get("https://discord.com/api/v10/users/@me/guilds", headers=headers, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    return await loop.run_in_executor(None, _fetch)
-
+# ================== دوال Discord API ==================
 async def exchange_code_for_token(code: str) -> Optional[str]:
-    """تبديل رمز التفويض بـ access_token."""
+    """تبديل كود التفويض بـ access_token."""
     loop = asyncio.get_running_loop()
     def _exchange():
         access = oauth_client.exchange_code(code)
@@ -96,8 +83,22 @@ async def exchange_code_for_token(code: str) -> Optional[str]:
     try:
         return await loop.run_in_executor(None, _exchange)
     except Exception as e:
-        logger.error(f"فشل تبديل الكود: {e}")
+        logger.error(f"فشل تبديل الكود: {e}", exc_info=True)
         return None
+
+async def fetch_guilds(access_token: str) -> List[dict]:
+    """جلب قائمة السيرفرات مباشرة من Discord API الرسمي."""
+    loop = asyncio.get_running_loop()
+    def _fetch():
+        headers = {"Authorization": f"Bearer {access_token}"}
+        r = requests.get(
+            "https://discord.com/api/v10/users/@me/guilds",
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json()
+    return await loop.run_in_executor(None, _fetch)
 
 def build_servers_text(guilds: List[dict]) -> str:
     if not guilds:
@@ -112,9 +113,11 @@ def build_servers_text(guilds: List[dict]) -> str:
 # ================== معالجات تيليجرام ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 أهلاً!\n"
-        "لجلب قائمة سيرفراتك على ديسكورد، أرسل لي أي رسالة (أو /auth) وسأعطيك رابط تفويض آمن.\n"
-        "بعد الضغط على الرابط والموافقة، سأعرض لك كل سيرفراتك مباشرة من Discord API الرسمي."
+        "👋 أهلاً بك!\n\n"
+        "هذا البوت يعرض لك قائمة سيرفرات ديسكورد التي أنت عضو فيها.\n"
+        "للبقاء آمناً، لا يطلب منك البوت أي كلمة مرور، بل يستخدم نظام التفويض الرسمي من ديسكورد (OAuth2).\n\n"
+        "🔹 أرسل الأمر /auth للحصول على رابط التفويض.\n"
+        "🔹 بعد الضغط على الرابط والموافقة، ارجع هنا وأرسل أي رسالة."
     )
 
 async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -122,15 +125,11 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = secrets.token_urlsafe(16)
     pending_auth[state] = chat_id
 
-    # توليد رابط التفويض
-    auth_url = oauth_client.generate_uri(
-        scope=["identify", "guilds"],
-        state=state,
-    )
+    auth_url = oauth_client.generate_uri(scope=["identify", "guilds"], state=state)
     keyboard = [[InlineKeyboardButton("🔗 تفويض الآن", url=auth_url)]]
     await update.message.reply_text(
         "اضغط على الزر أدناه لتفويض التطبيق بقراءة قائمة سيرفراتك.\n"
-        "هذا آمن ولن يرى التطبيق رسائلك أو كلمة المرور.",
+        "هذا آمن تماماً؛ التطبيق لا يرى رسائلك أو كلمة المرور الخاصة بك.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -140,7 +139,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not code:
         await update.message.reply_text(
-            "⚠️ لم يتم العثور على تفويض. الرجاء إرسال /auth أولاً للحصول على رابط التفويض."
+            "⚠️ لم يتم العثور على تفويض نشط.\n"
+            "الرجاء إرسال الأمر /auth أولاً للحصول على رابط التفويض."
         )
         return
 
@@ -148,23 +148,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     access_token = await exchange_code_for_token(code)
     if not access_token:
-        await update.message.reply_text("❌ فشل التفويض. يرجى المحاولة مرة أخرى عبر /auth.")
+        await update.message.reply_text("❌ فشل التفويض. يرجى المحاولة مرة أخرى باستخدام /auth.")
         return
 
     try:
-        guilds = await fetch_guilds_async(access_token)
+        guilds = await fetch_guilds(access_token)
+    except requests.HTTPError as e:
+        if e.response.status_code == 401:
+            await update.message.reply_text("❌ انتهت صلاحية التفويض. يرجى استخدام /auth مرة أخرى.")
+        else:
+            logger.error(f"HTTP error fetching guilds: {e}")
+            await update.message.reply_text("❌ حدث خطأ أثناء جلب السيرفرات. حاول لاحقاً.")
+        return
     except Exception as e:
-        logger.error(f"فشل جلب السيرفرات: {e}")
-        await update.message.reply_text("❌ حدث خطأ أثناء جلب السيرفرات. حاول لاحقًا.")
+        logger.error(f"خطأ غير متوقع: {e}", exc_info=True)
+        await update.message.reply_text("❌ حدث خطأ غير متوقع. حاول لاحقاً.")
         return
 
     if not guilds:
-        await update.message.reply_text("لم يتم العثور على سيرفرات.")
+        await update.message.reply_text("لم يتم العثور على أي سيرفرات.")
         return
 
     text_result = f"📊 إجمالي السيرفرات: **{len(guilds)}**\n\n" + build_servers_text(guilds)
 
-    # تقسيم الرسائل الطويلة
     if len(text_result) > 4000:
         chunks = [text_result[i:i+4000] for i in range(0, len(text_result), 4000)]
         for chunk in chunks:
@@ -175,12 +181,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== التشغيل الرئيسي ==================
 def main():
     if not all([TELEGRAM_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI]):
-        logger.error("تأكد من تعيين جميع المتغيرات البيئية المطلوبة.")
+        logger.error("تأكد من تعيين جميع المتغيرات البيئية المطلوبة: "
+                     "TELEGRAM_BOT_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI")
         return
 
-    # تشغيل Flask في خيط منفصل
     threading.Thread(target=run_flask, daemon=True).start()
-    logger.info(f"خادم Flask يعمل على المنفذ {WEB_PORT}")
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
