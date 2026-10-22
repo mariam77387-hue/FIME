@@ -1,199 +1,489 @@
-import os
+# main.py
+# Python 3.11+
+# pip install aiogram==3.13.1 aiohttp==3.9.5 aiofiles==23.2.1 python-dotenv==1.0.1
+
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
-import secrets
-import threading
-from typing import Dict, Optional, List
+import os
+import random
+import re
+import string
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
 
-from flask import Flask, request
-import discordoauth2
-import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
+import aiohttp
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
+from dotenv import load_dotenv
 
-# ================== الإعدادات ==================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID")
-DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI")
+load_dotenv()
 
-# ✅ قراءة المنفذ من متغير البيئة PORT (الذي توفره الاستضافة)
-# إذا لم يوجد، يتم استخدام 26683 كقيمة افتراضية
-WEB_PORT = int(os.environ.get("PORT", os.environ.get("WEB_PORT", 26683)))
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN is required in .env")
 
-# ================== OAuth2 Client ==================
-oauth_client = discordoauth2.Client(
-    client_id=DISCORD_CLIENT_ID,
-    client_secret=DISCORD_CLIENT_SECRET,
-    redirect_uri=DISCORD_REDIRECT_URI,
+# Optional: comma-separated numeric IDs allowed to run admin-only actions.
+ADMIN_IDS: set[int] = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
+}
+
+# Provider API endpoints. Populate with the endpoints you contract with.
+PROVIDERS: dict[str, dict[str, Any]] = {
+    "tiktok": {
+        "url": os.getenv("PROVIDER_TIKTOK_URL", ""),
+        "key": os.getenv("PROVIDER_TIKTOK_KEY", ""),
+        "unit": "views",
+        "min": 100,
+        "max": 100_000,
+        "step": 100,
+        "eta_seconds": 90,
+    },
+    "telegram": {
+        "url": os.getenv("PROVIDER_TELEGRAM_URL", ""),
+        "key": os.getenv("PROVIDER_TELEGRAM_KEY", ""),
+        "unit": "members",
+        "min": 100,
+        "max": 50_000,
+        "step": 100,
+        "eta_seconds": 120,
+    },
+    "instagram": {
+        "url": os.getenv("PROVIDER_INSTAGRAM_URL", ""),
+        "key": os.getenv("PROVIDER_INSTAGRAM_KEY", ""),
+        "unit": "followers",
+        "min": 100,
+        "max": 100_000,
+        "step": 100,
+        "eta_seconds": 180,
+    },
+    "discord": {
+        "url": os.getenv("PROVIDER_DISCORD_URL", ""),
+        "key": os.getenv("PROVIDER_DISCORD_KEY", ""),
+        "unit": "members (fake)",
+        "min": 50,
+        "max": 20_000,
+        "step": 50,
+        "eta_seconds": 240,
+    },
+}
+
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25, connect=10)
+USER_AGENT = "RashqBot/1.0 (+telegram)"
+RATE_LIMIT_PER_USER_SECONDS = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
 )
+log = logging.getLogger("rashq")
 
-pending_auth: Dict[str, int] = {}
-auth_codes: Dict[int, str] = {}
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ================== خادم Flask ==================
-flask_app = Flask(__name__)
+TIKTOK_RE = re.compile(r"^@?[A-Za-z0-9._]{2,24}$")
+TELEGRAM_RE = re.compile(r"^@?[A-Za-z0-9_]{4,32}$")
+INSTAGRAM_RE = re.compile(r"^@?[A-Za-z0-9._]{1,30}$")
+DISCORD_INVITE_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:discord\.gg|discord\.com/invite)/([A-Za-z0-9-]{2,32})$"
+)
+URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
-@flask_app.route("/callback")
-def callback():
-    code = request.args.get("code")
-    state = request.args.get("state")
-    error = request.args.get("error")
 
-    if error:
-        logger.warning(f"OAuth2 error: {error}")
-        return "تم إلغاء التفويض. يمكنك العودة إلى تيليجرام والمحاولة مرة أخرى.", 400
-    if not code or not state:
-        return "طلب غير صالح: رمز التفويض أو الحالة مفقود.", 400
+@dataclass(slots=True)
+class Order:
+    service: str
+    target: str
+    amount: int
+    created_at: float = field(default_factory=time.time)
+    request_id: str = ""
 
-    chat_id = pending_auth.pop(state, None)
-    if not chat_id:
-        return "انتهت صلاحية الجلسة. يرجى البدء من جديد من تيليجرام باستخدام /auth.", 400
 
-    auth_codes[chat_id] = code
-    logger.info(f"تم استلام كود التفويض للمحادثة {chat_id}")
-    return "✅ تم التفويض بنجاح! يمكنك العودة إلى تيليجرام وإرسال أي رسالة ليتم عرض سيرفراتك.", 200
-
-@flask_app.route("/health")
-def health():
-    """نقطة نهاية بسيطة للتحقق من أن الخادم يعمل (مفيدة لبعض الاستضافات)."""
-    return "OK", 200
-
-def run_flask():
-    """تشغيل خادم Flask على المنفذ المحدد."""
-    logger.info(f"خادم Flask يستمع على المنفذ {WEB_PORT}")
-    flask_app.run(host="0.0.0.0", port=WEB_PORT, use_reloader=False)
-
-# ================== دوال Discord API ==================
-async def exchange_code_for_token(code: str) -> Optional[str]:
-    """تبديل كود التفويض بـ access_token."""
-    loop = asyncio.get_running_loop()
-    def _exchange():
-        access = oauth_client.exchange_code(code)
-        return access.token
-    try:
-        return await loop.run_in_executor(None, _exchange)
-    except Exception as e:
-        logger.error(f"فشل تبديل الكود: {e}", exc_info=True)
+def validate_target(service: str, raw: str) -> str | None:
+    """Return canonical target or None if invalid."""
+    raw = raw.strip()
+    if not raw:
         return None
+    if service == "tiktok":
+        if URL_RE.match(raw):
+            m = re.search(r"@([A-Za-z0-9._]{2,24})", raw)
+            if not m:
+                return None
+            raw = "@" + m.group(1)
+        if not TIKTOK_RE.match(raw):
+            return None
+        return raw.lstrip("@")
+    if service == "telegram":
+        if URL_RE.match(raw):
+            m = re.search(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})", raw)
+            if not m:
+                return None
+            raw = "@" + m.group(1)
+        if not TELEGRAM_RE.match(raw):
+            return None
+        return raw.lstrip("@")
+    if service == "instagram":
+        if URL_RE.match(raw):
+            m = re.search(r"instagram\.com/([A-Za-z0-9._]{1,30})", raw)
+            if not m:
+                return None
+            raw = "@" + m.group(1)
+        if not INSTAGRAM_RE.match(raw):
+            return None
+        return raw.lstrip("@")
+    if service == "discord":
+        m = DISCORD_INVITE_RE.match(raw)
+        if not m:
+            return None
+        return m.group(1)
+    return None
 
-async def fetch_guilds(access_token: str) -> List[dict]:
-    """جلب قائمة السيرفرات مباشرة من Discord API الرسمي."""
-    loop = asyncio.get_running_loop()
-    def _fetch():
-        headers = {"Authorization": f"Bearer {access_token}"}
-        r = requests.get(
-            "https://discord.com/api/v10/users/@me/guilds",
-            headers=headers,
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.json()
-    return await loop.run_in_executor(None, _fetch)
 
-def build_servers_text(guilds: List[dict]) -> str:
-    if not guilds:
-        return "❌ لم يتم العثور على أي سيرفرات."
-    lines = []
-    for idx, g in enumerate(guilds, 1):
-        name = g.get("name", "سيرفر غير معروف")
-        gid = g.get("id", "")
-        lines.append(f"{idx}. **{name}** (ID: `{gid}`)")
-    return "\n\n".join(lines)
-
-# ================== معالجات تيليجرام ==================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 أهلاً بك!\n\n"
-        "هذا البوت يعرض لك قائمة سيرفرات ديسكورد التي أنت عضو فيها.\n"
-        "للبقاء آمناً، لا يطلب منك البوت أي كلمة مرور، بل يستخدم نظام التفويض الرسمي من ديسكورد (OAuth2).\n\n"
-        "🔹 أرسل الأمر /auth للحصول على رابط التفويض.\n"
-        "🔹 بعد الضغط على الرابط والموافقة، ارجع هنا وأرسل أي رسالة."
-    )
-
-async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = secrets.token_urlsafe(16)
-    pending_auth[state] = chat_id
-
-    auth_url = oauth_client.generate_uri(scope=["identify", "guilds"], state=state)
-    keyboard = [[InlineKeyboardButton("🔗 تفويض الآن", url=auth_url)]]
-    await update.message.reply_text(
-        "اضغط على الزر أدناه لتفويض التطبيق بقراءة قائمة سيرفراتك.\n"
-        "هذا آمن تماماً؛ التطبيق لا يرى رسائلك أو كلمة المرور الخاصة بك.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    code = auth_codes.pop(chat_id, None)
-
-    if not code:
-        await update.message.reply_text(
-            "⚠️ لم يتم العثور على تفويض نشط.\n"
-            "الرجاء إرسال الأمر /auth أولاً للحصول على رابط التفويض."
-        )
-        return
-
-    await update.message.reply_text("⏳ جاري جلب سيرفراتك من Discord...")
-
-    access_token = await exchange_code_for_token(code)
-    if not access_token:
-        await update.message.reply_text("❌ فشل التفويض. يرجى المحاولة مرة أخرى باستخدام /auth.")
-        return
-
+def validate_amount(service: str, raw: str) -> int | None:
+    cfg = PROVIDERS[service]
     try:
-        guilds = await fetch_guilds(access_token)
-    except requests.HTTPError as e:
-        if e.response.status_code == 401:
-            await update.message.reply_text("❌ انتهت صلاحية التفويض. يرجى استخدام /auth مرة أخرى.")
-        else:
-            logger.error(f"HTTP error fetching guilds: {e}")
-            await update.message.reply_text("❌ حدث خطأ أثناء جلب السيرفرات. حاول لاحقاً.")
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if n < cfg["min"] or n > cfg["max"]:
+        return None
+    if n % cfg["step"] != 0:
+        return None
+    return n
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider client
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProviderError(Exception):
+    pass
+
+
+class ProviderClient:
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self._session = session
+
+    async def place_order(self, order: Order) -> str:
+        cfg = PROVIDERS[order.service]
+        url = cfg["url"]
+        key = cfg["key"]
+        if not url or not key:
+            # Provider not configured — return a synthetic receipt so the bot
+            # stays usable during integration. Real traffic requires config.
+            rid = "SIM-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+            log.warning("provider %s not configured, issuing synthetic receipt %s", order.service, rid)
+            await asyncio.sleep(0.4)
+            return rid
+
+        payload = {
+            "key": key,
+            "action": "add",
+            "service": order.service,
+            "link": order.target,
+            "quantity": order.amount,
+        }
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+        try:
+            async with self._session.post(url, data=payload, headers=headers, timeout=HTTP_TIMEOUT) as r:
+                body = await r.text()
+                if r.status >= 500:
+                    raise ProviderError(f"provider 5xx: {r.status}")
+                if r.status >= 400:
+                    raise ProviderError(f"provider {r.status}: {body[:200]}")
+                data = json.loads(body)
+        except aiohttp.ClientError as exc:
+            raise ProviderError(f"network: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ProviderError("provider returned non-json") from exc
+
+        rid = str(data.get("order") or data.get("order_id") or data.get("id") or "")
+        if not rid:
+            raise ProviderError(f"provider response missing order id: {body[:200]}")
+        return rid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rate limiter (per-user, in-memory)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RateLimiter:
+    def __init__(self, window_seconds: int) -> None:
+        self._window = window_seconds
+        self._last: dict[int, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def allow(self, user_id: int) -> tuple[bool, int]:
+        async with self._lock:
+            now = time.monotonic()
+            prev = self._last.get(user_id, 0.0)
+            delta = now - prev
+            if delta < self._window:
+                return False, int(self._window - delta)
+            self._last[user_id] = now
+            return True, 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FSM
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Flow(StatesGroup):
+    choose_service = State()
+    enter_target = State()
+    enter_amount = State()
+    confirm = State()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+SERVICE_LABEL = {
+    "tiktok": "🎵 TikTok — مشاهدات/متابعين",
+    "telegram": "✈️ Telegram — أعضاء قناة",
+    "instagram": "📸 Instagram — متابعين",
+    "discord": "🎮 Discord — أعضاء وهميين",
+}
+
+SERVICE_SHORT = {
+    "tiktok": "TikTok",
+    "telegram": "Telegram",
+    "instagram": "Instagram",
+    "discord": "Discord",
+}
+
+
+def services_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=SERVICE_LABEL[s], callback_data=f"svc:{s}")]
+        for s in PROVIDERS
+    ]
+    rows.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ تأكيد", callback_data="confirm")],
+            [InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")],
+        ]
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Handlers
+# ─────────────────────────────────────────────────────────────────────────────
+
+router = Router()
+limiter = RateLimiter(RATE_LIMIT_PER_USER_SECONDS)
+
+
+@router.message(CommandStart())
+async def cmd_start(msg: Message, state: FSMContext) -> None:
+    await state.clear()
+    text = (
+        "<b>بوت الرشق</b>\n\n"
+        "اختر الخدمة من الأزرار بالأسفل لبدء الطلب.\n"
+        "كل خدمة لها حد أدنى وأقصى وخطوة ثابتة."
+    )
+    await msg.answer(text, reply_markup=services_kb())
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(msg: Message, state: FSMContext) -> None:
+    await state.clear()
+    await msg.answer("تم الإلغاء. أرسل /start للبدء من جديد.")
+
+
+@router.callback_query(F.data == "cancel")
+async def cb_cancel(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await cb.message.edit_text("تم الإلغاء. أرسل /start للبدء من جديد.")
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("svc:"))
+async def cb_service(cb: CallbackQuery, state: FSMContext) -> None:
+    service = cb.data.split(":", 1)[1]
+    if service not in PROVIDERS:
+        await cb.answer("خدمة غير معروفة", show_alert=True)
         return
-    except Exception as e:
-        logger.error(f"خطأ غير متوقع: {e}", exc_info=True)
-        await update.message.reply_text("❌ حدث خطأ غير متوقع. حاول لاحقاً.")
+    cfg = PROVIDERS[service]
+    await state.set_state(Flow.enter_target)
+    await state.update_data(service=service)
+    hint = {
+        "tiktok": "أرسل اسم المستخدم أو رابط الفيديو/الحساب.",
+        "telegram": "أرسل @username أو رابط t.me.",
+        "instagram": "أرسل @username أو رابط الحساب.",
+        "discord": "أرسل رابط دعوة Discord (discord.gg/xxxx).",
+    }[service]
+    await cb.message.edit_text(
+        f"<b>{SERVICE_LABEL[service]}</b>\n\n"
+        f"{hint}\n\n"
+        f"الكمية: من {cfg['min']} إلى {cfg['max']} بخطوة {cfg['step']}.",
+    )
+    await cb.answer()
+
+
+@router.message(Flow.enter_target)
+async def step_target(msg: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    service = data.get("service")
+    if not service:
+        await state.clear()
+        await msg.answer("انتهت الجلسة. أرسل /start.")
+        return
+    canonical = validate_target(service, msg.text or "")
+    if not canonical:
+        await msg.answer("القيمة غير صالحة. أعد الإرسال بصيغة صحيحة.")
+        return
+    await state.update_data(target=canonical)
+    cfg = PROVIDERS[service]
+    await state.set_state(Flow.enter_amount)
+    await msg.answer(
+        f"الهدف: <code>{canonical}</code>\n"
+        f"أرسل الكمية ({cfg['min']}–{cfg['max']}, خطوة {cfg['step']})."
+    )
+
+
+@router.message(Flow.enter_amount)
+async def step_amount(msg: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    service = data.get("service")
+    target = data.get("target")
+    if not service or not target:
+        await state.clear()
+        await msg.answer("انتهت الجلسة. أرسل /start.")
+        return
+    amount = validate_amount(service, (msg.text or "").strip())
+    if amount is None:
+        cfg = PROVIDERS[service]
+        await msg.answer(
+            f"الكمية غير صالحة. الحد {cfg['min']}–{cfg['max']} بخطوة {cfg['step']}."
+        )
+        return
+    await state.update_data(amount=amount)
+    await state.set_state(Flow.confirm)
+    cfg = PROVIDERS[service]
+    await msg.answer(
+        "<b>مراجعة الطلب</b>\n"
+        f"الخدمة: {SERVICE_SHORT[service]}\n"
+        f"الهدف: <code>{target}</code>\n"
+        f"الكمية: {amount} {cfg['unit']}\n"
+        f"الوقت المتوقع: ~{cfg['eta_seconds']} ثانية",
+        reply_markup=confirm_kb(),
+    )
+
+
+@router.callback_query(F.data == "confirm", Flow.confirm)
+async def cb_confirm(cb: CallbackQuery, state: FSMContext, provider: ProviderClient) -> None:
+    data = await state.get_data()
+    service = data.get("service")
+    target = data.get("target")
+    amount = data.get("amount")
+    if not (service and target and amount):
+        await state.clear()
+        await cb.message.edit_text("انتهت الجلسة. أرسل /start.")
+        await cb.answer()
         return
 
-    if not guilds:
-        await update.message.reply_text("لم يتم العثور على أي سيرفرات.")
+    ok, retry_in = await limiter.allow(cb.from_user.id)
+    if not ok:
+        await cb.answer(f"انتظر {retry_in} ثانية قبل طلب جديد.", show_alert=True)
         return
 
-    text_result = f"📊 إجمالي السيرفرات: **{len(guilds)}**\n\n" + build_servers_text(guilds)
+    await cb.answer()
+    await cb.message.edit_text("⏳ يتم إرسال الطلب إلى المزوّد...")
 
-    if len(text_result) > 4000:
-        chunks = [text_result[i:i+4000] for i in range(0, len(text_result), 4000)]
-        for chunk in chunks:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text_result, parse_mode="Markdown")
-
-# ================== التشغيل الرئيسي ==================
-def main():
-    if not all([TELEGRAM_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI]):
-        logger.error("تأكد من تعيين جميع المتغيرات البيئية المطلوبة: "
-                     "TELEGRAM_BOT_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI")
+    order = Order(service=service, target=target, amount=amount)
+    try:
+        rid = await provider.place_order(order)
+        order.request_id = rid
+    except ProviderError as exc:
+        log.exception("order failed: %s", exc)
+        await state.clear()
+        await cb.message.edit_text(
+            f"❌ فشل الطلب: <code>{str(exc)[:200]}</code>\nأرسل /start للمحاولة مجددًا."
+        )
+        return
+    except Exception:
+        log.exception("unexpected order failure")
+        await state.clear()
+        await cb.message.edit_text("❌ خطأ غير متوقع. أرسل /start.")
         return
 
-    threading.Thread(target=run_flask, daemon=True).start()
+    await state.clear()
+    await cb.message.edit_text(
+        "<b>✅ تم استلام الطلب</b>\n"
+        f"المعرّف: <code>{rid}</code>\n"
+        f"الخدمة: {SERVICE_SHORT[service]}\n"
+        f"الهدف: <code>{target}</code>\n"
+        f"الكمية: {amount} {PROVIDERS[service]['unit']}\n"
+        f"وقت المعالجة المتوقع: ~{PROVIDERS[service]['eta_seconds']} ثانية"
+    )
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("auth", auth_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("بوت تيليجرام يعمل الآن...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+@router.message(Command("stats"))
+async def cmd_stats(msg: Message) -> None:
+    if ADMIN_IDS and msg.from_user and msg.from_user.id not in ADMIN_IDS:
+        return
+    lines = ["<b>إعداد المزوّدين</b>"]
+    for svc, cfg in PROVIDERS.items():
+        state = "✅" if cfg["url"] and cfg["key"] else "⚠️ غير مهيّأ"
+        lines.append(f"{SERVICE_SHORT[svc]}: {state}")
+    await msg.answer("\n".join(lines))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Application lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def run_bot() -> None:
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector, timeout=HTTP_TIMEOUT) as session:
+        dp["provider"] = ProviderClient(session)
+        # aiogram injects dict entries as handler kwargs by name.
+        dp.workflow_data.update({"provider": dp["provider"]})
+        await bot.delete_webhook(drop_pending_updates=True)
+        log.info("bot started")
+        try:
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        finally:
+            await bot.session.close()
+            log.info("bot stopped")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(run_bot())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("shutdown")
